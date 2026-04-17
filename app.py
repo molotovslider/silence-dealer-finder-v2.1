@@ -357,7 +357,7 @@ def hunter_search(domain, excl, log, timeout=15):
         return {}
 
 # ── Trouver le vrai site du concessionnaire ───────────────────────────────────
-def find_dealer_domain(name, addr, log, delay=1.0):
+def find_dealer_domain(name, addr, log, delay=0.5):
     city = ""
     if addr:
         m = re.search(r"\d{5}\s+(\S+)", addr)
@@ -377,9 +377,9 @@ def find_dealer_domain(name, addr, log, delay=1.0):
                 if any(p in dom for p in PLATFORM_SKIP): continue
                 log(f"  Site: {dom}")
                 return dom
-            time.sleep(delay)
+            time.sleep(delay * 0.5)
         except Exception as e:
-            log(f"  find_domain: {str(e)[:40]}")
+            pass  # silent fail, move to next
     return ""
 
 def scrape_domain_emails(domain, excl, log, timeout=12):
@@ -405,55 +405,76 @@ def scrape_domain_emails(domain, excl, log, timeout=12):
     return found
 
 # ── Enrichissement complet ────────────────────────────────────────────────────
-def enrich_dealer(dealer, excl, log, delay=1.2, timeout=15):
-    all_em = dict(dealer.get("emails", {}))
-    src = dealer.get("src", "pending")
+def google_search_emails(name, addr, excl, log):
+    """
+    Search Google/DuckDuckGo for emails directly.
+    Strategy: "DEALER NAME email" → grab emails from snippets.
+    Much faster than finding website first.
+    """
+    found = set()
+    city = ""
+    if addr:
+        m = re.search(r"\d{5}\s+(\S+)", addr)
+        if m: city = m.group(1)
 
+    queries = [
+        f'"{name}" email',
+        f'"{name}" {city} email' if city else None,
+        f'"{name}" contact mail',
+        f'{name} {city} concessionnaire email' if city else f'{name} concessionnaire email',
+    ]
+
+    for q in [x for x in queries if x]:
+        try:
+            url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(q)
+            html = fetch(url, timeout=12, ref="https://duckduckgo.com")
+            # Strip HTML tags, keep text
+            clean = re.sub(r"<[^>]+>", " ", html)
+            clean = re.sub(r"\s+", " ", clean)
+            emails = get_emails(clean, excl)
+            if emails:
+                found.update(emails)
+                log(f"  Google: {len(emails)} email(s) pour '{name[:30]}'")
+                break
+            time.sleep(random.uniform(0.3, 0.8))
+        except Exception as e:
+            log(f"  Search err: {str(e)[:40]}")
+    return found
+
+
+def enrich_dealer(dealer, excl, log, delay=0.8, timeout=15):
+    """
+    Enrichment pipeline (fast first, deep if needed):
+    1. Direct Google search "name email" → fastest
+    2. Find dealer website → scrape emails
+    3. Hunter.io on domain → professional contacts
+    """
+    all_em = dict(dealer.get("emails", {}))
+    src    = dealer.get("src", "pending")
+
+    # ── Step 1: Direct Google search (fastest) ────────────────────────────
+    direct = google_search_emails(dealer["name"], dealer["addr"], excl, log)
+    if direct:
+        for e in direct:
+            if e not in all_em: all_em[e] = guess_role(e)
+        src = "web"
+
+    # ── Step 2: Find dealer's own website + scrape ────────────────────────
     domain = find_dealer_domain(dealer["name"], dealer["addr"], log, delay)
     if domain:
         dealer["website"] = domain
         scraped = scrape_domain_emails(domain, excl, log, timeout)
         for e in scraped:
             if e not in all_em: all_em[e] = guess_role(e)
-        if scraped: src = "web"
+        if scraped and src == "pending": src = "web"
 
-    if domain:
+        # ── Step 3: Hunter.io (richest data: name + position) ─────────────
         h = hunter_search(domain, excl, log, timeout)
-        all_em.update(h)
+        all_em.update(h)  # Hunter overrides with better role info
         if h: src = "hunter"
 
     return {e: r for e, r in all_em.items() if is_real(e)}, src
 
-# ── Scraper de page réseau ────────────────────────────────────────────────────
-def fetch_full(url, timeout=18, retries=4):
-    """Fetch with headers that trigger full server-side rendering."""
-    last = None
-    for attempt in range(retries):
-        try:
-            headers = {
-                "User-Agent": random.choice(UA_POOL),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Connection": "keep-alive",
-                "Referer": "https://www.google.com/",
-                "DNT": "1",
-                "Upgrade-Insecure-Requests": "1",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "cross-site",
-                "Cache-Control": "max-age=0",
-            }
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                raw = r.read()
-                enc = r.headers.get_content_charset("utf-8") or "utf-8"
-                return raw.decode(enc, errors="replace")
-        except Exception as e:
-            last = e
-            if attempt < retries - 1:
-                time.sleep(2 * (attempt + 1) + random.uniform(0, 2))
-    raise last or Exception(f"Échec: {url}")
 
 def scrape_page(url, excl, log, prog, timeout=18, retries=3):
     prog(5, "Chargement de la page…")
@@ -989,15 +1010,39 @@ class App(tk.Tk):
             if self._v1.get():
                 pending=[d for d in dealers if not d["emails"]]
                 self._log_add(f"Enrichissement: {len(pending)} concessionnaires sans email…")
-                for i,d in enumerate(pending):
-                    pct=45+int(48*i/max(len(pending),1))
-                    self._set_prog(pct,f"Enrichissement {i+1}/{len(pending)} — {d['name'][:30]}")
-                    self._log_add(f"→ {d['name'][:50]}")
-                    ne,src=enrich_dealer(d,excl,self._log_add,delay=dly,timeout=to)
-                    if ne:
-                        if fg: ne={e:r for e,r in ne.items() if e.split("@")[0].lower() not in GENERIC_PREFIXES}
-                        d["emails"]=ne; d["src"]=src
-                    time.sleep(random.uniform(dly*0.8, dly*1.2))
+                done_count = [0]
+                lock = threading.Lock()
+
+                def enrich_one(d):
+                    try:
+                        ne,src=enrich_dealer(d,excl,self._log_add,delay=dly,timeout=to)
+                        if ne:
+                            if fg: ne={e:r for e,r in ne.items() if e.split("@")[0].lower() not in GENERIC_PREFIXES}
+                            d["emails"]=ne; d["src"]=src
+                    except Exception as e:
+                        self._log_add(f"  Erreur {d['name'][:30]}: {e}")
+                    finally:
+                        with lock:
+                            done_count[0] += 1
+                            pct = 45 + int(48 * done_count[0] / max(len(pending), 1))
+                            self._set_prog(pct, f"Enrichissement {done_count[0]}/{len(pending)} — {d['name'][:25]}")
+
+                # Run 4 dealers in parallel
+                MAX_WORKERS = 4
+                threads = []
+                for d in pending:
+                    t = threading.Thread(target=enrich_one, args=(d,), daemon=True)
+                    threads.append(t)
+                    t.start()
+                    # Limit concurrency to MAX_WORKERS
+                    running = [t for t in threads if t.is_alive()]
+                    while len(running) >= MAX_WORKERS:
+                        time.sleep(0.3)
+                        running = [t for t in threads if t.is_alive()]
+
+                # Wait for all to finish
+                for t in threads:
+                    t.join(timeout=30)
 
             if self._v2.get():
                 seen,uniq=set(),[]
