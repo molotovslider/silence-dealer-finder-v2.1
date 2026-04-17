@@ -3,8 +3,39 @@
 """Silence.eco — Dealer Finder v11 — Production"""
 import tkinter as tk
 import json, re, time, os, csv, random, threading, urllib.request, urllib.parse, urllib.error
+import subprocess, sys
 from tkinter import ttk, messagebox, scrolledtext
 from datetime import datetime
+
+# ── Auto-install missing modules at first launch ──────────────────────────────
+def _ensure_deps():
+    needed = []
+    try: import selenium
+    except ImportError: needed.append("selenium")
+    try: import webdriver_manager
+    except ImportError: needed.append("webdriver-manager")
+    try: import bs4
+    except ImportError: needed.append("beautifulsoup4")
+    try: import requests
+    except ImportError: needed.append("requests")
+
+    if needed:
+        try:
+            root = tk.Tk(); root.withdraw()
+            from tkinter import messagebox
+            messagebox.showinfo(
+                "Silence Dealer Finder — Installation",
+                f"Installation des modules requis :\n{chr(10).join(needed)}\n\nCela prend 30 secondes, l'app redémarre ensuite."
+            )
+            root.destroy()
+        except Exception:
+            pass
+        for pkg in needed:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "--quiet"])
+        # Restart app after install
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+_ensure_deps()
 
 # ── Clés API intégrées ────────────────────────────────────────────────────────
 HUNTER_KEY = "6f720d52e7ff130ef0717a890cd35abcac84c6fd"
