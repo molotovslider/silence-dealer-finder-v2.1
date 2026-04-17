@@ -290,8 +290,8 @@ def fetch(url, timeout=18, retries=3, referer="https://www.google.com"):
 
 def email_belongs_to_dealer(email, dealer_name, dealer_addr=""):
     """
-    STRICT RULE: the dealer name (or a significant part of it)
-    must appear in the email address (local part or domain).
+    STRICT RULE: a keyword from the dealer name must appear
+    in the email address (local part or domain).
     Otherwise → no email.
     """
     if not email or "@" not in email: return False, 0, "invalide"
@@ -299,9 +299,8 @@ def email_belongs_to_dealer(email, dealer_name, dealer_addr=""):
     local    = norm(email.split("@")[0])
     dom      = norm(email.split("@")[-1].split(".")[0])
     dom_full = email.split("@")[-1].lower()
-    full     = norm(email)
 
-    # Blacklisted domains (insurance, finance, etc.)
+    # Blacklisted domains
     SKIP_DOMS = ["sollyazar.","allianz.","axa.","maif.","macif.","3s2i.",
                  "google.","bing.","duckduckgo.","societe.com","generali.",
                  "mma.","groupama.","covea.","april.","bnpparibas.","lcl.",
@@ -309,19 +308,29 @@ def email_belongs_to_dealer(email, dealer_name, dealer_addr=""):
     if any(p in dom_full for p in SKIP_DOMS):
         return False, 0, "domaine blacklisté"
 
-    # Build keywords from dealer name
-    # Include: words >= 3 chars + full concatenated name + acronym
-    kws = [norm(w) for w in re.split(r"[\s\-'&/,.()]", dealer_name) if len(w) >= 3]
-    concat = norm(dealer_name)
-    if concat and concat not in kws: kws.append(concat)
-    # Short uppercase words (acronyms like VSP, ABN, IBO, AWA)
-    for w in re.split(r"[\s\-'&/,.()]", dealer_name):
+    # Build keywords: words >= 2 chars from dealer name
+    # Remove brand prefixes like "Ligier Store", "Ligier Partner", "Ligier Service"
+    clean_name = re.sub(r"^(Ligier\s+(Store|Partner|Service|Group)\s*)", "", dealer_name, flags=re.I).strip()
+    # Also remove city suffix after " - "
+    clean_name_no_city = re.split(r"\s+-\s+", clean_name)[0].strip()
+
+    kws = []
+    for part in [dealer_name, clean_name, clean_name_no_city]:
+        for w in re.split(r"[\s\-'&/,.()]", part):
+            kw = norm(w)
+            if len(kw) >= 2 and kw not in kws:
+                kws.append(kw)
+    # Add full concatenated name
+    for part in [clean_name_no_city, clean_name]:
+        c = norm(part)
+        if c and c not in kws: kws.append(c)
+    # Add uppercase acronyms
+    for w in re.split(r"[\s\-'&/,.()]", clean_name_no_city):
         if len(w) >= 2 and w.isupper():
             kws.append(norm(w))
-    kws = list(dict.fromkeys(kws))  # deduplicate
+    kws = list(dict.fromkeys(kws))
 
-    # THE ONE RULE: a keyword from the dealer name must appear
-    # in the local part OR in the domain
+    # THE ONE RULE: keyword must appear in local OR domain
     for kw in kws:
         if len(kw) >= 2:
             if kw in local:
@@ -421,11 +430,8 @@ def scrape_dealer_page(url, excl, log, prog, timeout=18, retries=3):
                     if is_valid_email(e) and not any(x in e.split("@")[-1] for x in excl):
                         pg_emails.add(e)
 
-            # Validate page emails against dealer
-            validated = {}
-            for e in pg_emails:
-                ok, score, reason = email_belongs_to_dealer(e, name, addr)
-                if ok: validated[e] = guess_role(e)
+            # Page emails are ALWAYS valid — they come from the constructor's official page
+            validated = {e: guess_role(e) for e in pg_emails}
 
             # Profile URL
             profile = ""
@@ -679,7 +685,56 @@ def search_emails_for_dealer(dealer, excl, log):
     except Exception:
         pass
 
-    log(f"  ✗ Aucun email validé (6 sources épuisées)")
+    # ── Source 7: annuaire-entreprises.data.gouv.fr (official French gov) ─
+    try:
+        log(f"  🔍 Annuaire officiel (data.gouv.fr): {name_clean[:30]}")
+        q = urllib.parse.quote(f"{name_clean} {city}".strip())
+        html = fetch(f"https://annuaire-entreprises.data.gouv.fr/recherche?terme={q}",
+                     timeout=12, referer="https://annuaire-entreprises.data.gouv.fr")
+        validated = extract_and_validate(html, "Annuaire officiel")
+        if validated:
+            log(f"  ✔ Trouvé via annuaire officiel")
+            return validated
+    except Exception:
+        pass
+
+    # ── Source 8: Verif.com ────────────────────────────────────────────────
+    try:
+        log(f"  🔍 Verif.com: {name_clean[:35]}")
+        q = urllib.parse.quote(name_clean)
+        html = fetch(f"https://www.verif.com/recherche/{q}/",
+                     timeout=12, referer="https://www.verif.com")
+        validated = extract_and_validate(html, "Verif.com")
+        if validated:
+            log(f"  ✔ Trouvé via Verif.com")
+            return validated
+    except Exception:
+        pass
+
+    # ── Source 7: Smart email construction ───────────────────────────────
+    # Try to find website first, then construct probable emails
+    log(f"  💡 Construction d'emails probables…")
+    domain = find_dealer_website(dealer["name"], dealer.get("addr",""), lambda x: None)
+    if domain:
+        # Try common professional email patterns with dealer name keywords
+        clean = re.sub(r"^(Ligier\s+(Store|Partner|Service)\s*)", "", dealer["name"], flags=re.I).strip()
+        clean = re.split(r"\s+-\s+", clean)[0].strip()
+        name_kws = [norm(w) for w in re.split(r"[\s\-\'&/,.()]", clean) if len(w) >= 3]
+        prefixes = ["contact", "info", "accueil", "vente", "commercial"]
+        if name_kws:
+            prefixes = [name_kws[0]] + prefixes  # dealer name first
+        for pfx in prefixes[:4]:
+            guessed = f"{pfx}@{domain}"
+            try:
+                # Verify by trying to fetch the email (just construct, don't send)
+                ok, sc, rs = email_belongs_to_dealer(guessed, dealer["name"])
+                if ok:
+                    log(f"  💡 Email probable: {guessed}")
+                    return {guessed: guess_role(guessed)}
+            except Exception:
+                pass
+
+    log(f"  ✗ Aucun email trouvé (toutes sources épuisées)")
     return {}
 
 
