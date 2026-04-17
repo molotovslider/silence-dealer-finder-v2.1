@@ -239,17 +239,21 @@ def fetch(url, timeout=18, retries=3, referer="https://www.google.com"):
             driver = webdriver.Chrome(options=opts)
         driver.set_page_load_timeout(timeout)
         driver.get(url)
-        # Wait for dynamic content (emails loaded via JS)
-        wait_time = 4 if "ligier" in url.lower() or "reseau" in url.lower() else 2
-        time.sleep(wait_time)
-        # Scroll to trigger lazy loading
-        try:
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
+        # Wait until emails appear in DOM (stop early if found, max 12s)
+        prev_size = 0
+        for _ in range(12):
             time.sleep(1)
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(1.5)
-        except Exception:
-            pass
+            try:
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            except Exception:
+                pass
+            html_tmp = driver.page_source
+            if EMAIL_RE.search(html_tmp):
+                break  # emails found — stop waiting
+            curr = len(html_tmp)
+            if curr == prev_size and curr > 10000:
+                break  # page stopped growing
+            prev_size = curr
         html = driver.page_source
         driver.quit()
         if html and len(html) > 3000:
@@ -552,95 +556,7 @@ def scrape_dealer_page(url, excl, log, prog, timeout=18, retries=3):
 
     log(f"✓ {len(final)} concessionnaires uniques")
 
-    # ── If 0 emails on main page: fetch individual dealer pages ───────────
-    no_email_count = sum(1 for d in final if not d["emails"])
-    if no_email_count == len(final) and len(final) > 0:
-        log(f"⚠ 0 email sur la page principale — scraping des fiches individuelles…")
-
-        base = re.match(r"https?://[^/]+", url)
-        base_url2 = base.group(0) if base else ""
-
-        def make_slug(name):
-            s = unicodedata.normalize("NFD", name.lower())
-            s = "".join(c for c in s if unicodedata.category(c) != "Mn")
-            s = re.sub(r"[^a-z0-9\s]", " ", s)
-            s = re.sub(r"\s+", "-", s.strip()).strip("-")
-            return re.sub(r"-+", "-", s)
-
-        def fetch_fiche(dealer):
-            """Try multiple URL patterns for dealer individual page."""
-            name = dealer["name"]
-            slug = make_slug(name)
-            profile = dealer.get("profile_url", "")
-
-            # Try known URL patterns
-            candidates = []
-            if profile: candidates.append(profile)
-            candidates += [
-                f"{base_url2}/reseau/{slug}/",
-                f"{base_url2}/reseau/{slug}",
-                f"{base_url2}/network/{slug}/",
-            ]
-            # Also try slug without city (after last dash-word)
-            slug_short = "-".join(slug.split("-")[:-1]) if "-" in slug else slug
-            if slug_short != slug:
-                candidates.append(f"{base_url2}/reseau/{slug_short}/")
-
-            for candidate_url in candidates:
-                try:
-                    html = fetch(candidate_url, timeout=12, referer=url)
-                    if len(html) < 2000: continue
-                    from bs4 import BeautifulSoup
-                    soup = BeautifulSoup(html, "html.parser")
-                    txt  = soup.get_text(" ", strip=True)
-                    # Collect all emails — page emails are always valid
-                    emails = get_emails_raw(txt, excl)
-                    for a in soup.find_all("a", href=True):
-                        if a["href"].startswith("mailto:"):
-                            e = a["href"][7:].split("?")[0].strip().lower()
-                            if is_valid_email(e): emails.add(e)
-                    if emails:
-                        dealer["profile_url"] = candidate_url
-                        return {e: guess_role(e) for e in emails}
-                except Exception:
-                    continue
-            return {}
-
-        # Test on first 3 dealers to see if individual pages work
-        found_individual = False
-        for d in final[:3]:
-            result = fetch_fiche(d)
-            if result:
-                d["emails"] = result
-                d["src"] = "page"
-                log(f"  ✅ Fiche individuelle fonctionne: {d['name'][:35]} → {list(result.keys())[0]}")
-                found_individual = True
-                break
-
-        if found_individual:
-            log(f"  → Chargement de toutes les fiches individuelles ({len(final)})…")
-            import concurrent.futures
-            def process_fiche(d):
-                if not d["emails"]:
-                    result = fetch_fiche(d)
-                    if result:
-                        d["emails"] = result
-                        d["src"] = "page"
-                return d
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
-                futures = {ex.submit(process_fiche, d): d for d in final if not d["emails"]}
-                done = 0
-                for future in concurrent.futures.as_completed(futures):
-                    done += 1
-                    if done % 10 == 0:
-                        log(f"  {done}/{len(futures)} fiches traitées…")
-                    time.sleep(0.1)
-
-            with_email = sum(1 for d in final if d["emails"])
-            log(f"  ✓ {with_email}/{len(final)} concessionnaires avec email via fiches")
-        else:
-            log(f"  ↳ Fiches individuelles inaccessibles — enrichissement web en fallback")
+    # Emails not on main page → enrichment pipeline handles per-dealer
 
     return final
 
