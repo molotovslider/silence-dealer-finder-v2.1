@@ -174,24 +174,45 @@ def guess_role(email):
 
 # ── Fetch robuste ─────────────────────────────────────────────────────────────
 def fetch(url, timeout=18, retries=3, ref="https://www.google.com"):
+    """
+    Fetch with multiple strategies:
+    1. Full browser headers + session cookies
+    2. Playwright headless browser if available
+    3. Requests library if available
+    """
     last = None
+
+    # ── Strategy A: urllib with full browser headers + session ────────────
     for attempt in range(retries):
         try:
-            headers = {
-                "User-Agent": random.choice(UA_POOL),
-                "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
-                "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.7",
-                "Accept-Encoding": "gzip, deflate",
-                "Connection": "keep-alive",
-                "Referer": ref,
-                "DNT": "1",
-                "Upgrade-Insecure-Requests": "1",
-            }
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            opener = urllib.request.build_opener(
+                urllib.request.HTTPCookieProcessor()  # handle cookies like real browser
+            )
+            headers = [
+                ("User-Agent", random.choice(UA_POOL)),
+                ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"),
+                ("Accept-Language", "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7"),
+                ("Accept-Encoding", "gzip, deflate, br"),
+                ("Connection", "keep-alive"),
+                ("Referer", ref),
+                ("DNT", "1"),
+                ("Sec-Fetch-Dest", "document"),
+                ("Sec-Fetch-Mode", "navigate"),
+                ("Sec-Fetch-Site", "same-origin"),
+                ("Sec-Fetch-User", "?1"),
+                ("Upgrade-Insecure-Requests", "1"),
+                ("Cache-Control", "max-age=0"),
+            ]
+            opener.addheaders = headers
+            with opener.open(url, timeout=timeout) as r:
                 raw = r.read()
                 enc = r.headers.get_content_charset("utf-8") or "utf-8"
-                return raw.decode(enc, errors="replace")
+                html = raw.decode(enc, errors="replace")
+                # Check if we got real content (not blocked/empty)
+                if len(html) > 5000:
+                    return html
+                # If too small, might be blocked — try playwright
+                last = Exception(f"Page trop courte: {len(html)} chars")
         except urllib.error.HTTPError as e:
             last = e
             if e.code in (403, 429, 503):
@@ -202,7 +223,48 @@ def fetch(url, timeout=18, retries=3, ref="https://www.google.com"):
             last = e
             if attempt < retries - 1:
                 time.sleep(1.5 * (attempt + 1))
-    raise last or Exception(f"Échec après {retries} tentatives: {url}")
+
+    # ── Strategy B: Playwright headless browser ───────────────────────────
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=random.choice(UA_POOL),
+                locale="fr-FR",
+                extra_http_headers={"Accept-Language": "fr-FR,fr;q=0.9"},
+            )
+            page = context.new_page()
+            page.goto(url, wait_until="networkidle", timeout=timeout*1000)
+            html = page.content()
+            browser.close()
+            if len(html) > 5000:
+                return html
+    except ImportError:
+        pass  # playwright not installed
+    except Exception as e:
+        last = e
+
+    # ── Strategy C: requests library ──────────────────────────────────────
+    try:
+        import requests
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": random.choice(UA_POOL),
+            "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
+            "Accept-Language": "fr-FR,fr;q=0.9",
+            "Referer": ref,
+        })
+        resp = session.get(url, timeout=timeout, allow_redirects=True)
+        resp.encoding = resp.apparent_encoding
+        if len(resp.text) > 2000:
+            return resp.text
+    except ImportError:
+        pass
+    except Exception as e:
+        last = e
+
+    raise last or Exception(f"Impossible de charger: {url}")
 
 # ── Email utils ───────────────────────────────────────────────────────────────
 def is_real(e, filter_generic=False):
