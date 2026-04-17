@@ -115,21 +115,114 @@ def fetch(url, timeout=14):
         enc = resp.headers.get_content_charset("utf-8") or "utf-8"
         return raw.decode(enc, errors="replace")
 
+# ── Email validation ───────────────────────────────────────────────────────
+FAKE_DOMAINS = [
+    "duckduckgo.com","example.com","test.com","domain.com","email.com",
+    "mail.com","noreply.com","sentry.io","w3.org","schema.org","google.com",
+    "placeholder.com","cloudflare.com","jquery.com","facebook.com","twitter.com",
+    "instagram.com","youtube.com","microsoft.com","apple.com","amazon.com",
+    "wixpress.com","squarespace.com","wordpress.com","shopify.com",
+]
+ROLE_KEYWORDS = {
+    "contact","info","commercial","vente","ventes","sales","marketing",
+    "direction","directeur","manager","comptabilite","comptable","accounting",
+    "accueil","reception","secretariat","administration","admin","rh","hr",
+    "patron","gerant","pdg","ceo","apv","service","atelier","technique",
+}
+
+def is_real_email(e):
+    if not e or len(e) < 7: return False
+    local, dom = e.split("@")[0], e.split("@")[-1].lower()
+    if any(f in dom for f in FAKE_DOMAINS): return False
+    if len(dom.split(".")[0]) < 2: return False
+    if re.search(r"\.(png|jpg|gif|css|js|svg|ico|woff)$", dom): return False
+    return True
+
+def guess_role(email):
+    """Return a human-readable role label based on email prefix."""
+    local = email.split("@")[0].lower().replace(".", "").replace("-", "").replace("_", "")
+    role_map = [
+        (["direction","directeur","directrice","pdg","ceo","gerant","patron","dg"], "Direction"),
+        (["commercial","vente","ventes","sales","vendeur","vendeuse"],              "Commercial"),
+        (["marketing","communication","comm","promo"],                              "Marketing"),
+        (["comptabilite","comptable","compta","facturation","accounting"],          "Comptabilité"),
+        (["contact","info","information","hello","bonjour","accueil","reception"],  "Contact général"),
+        (["apv","atelier","technique","sav","service","reparation"],               "Après-vente"),
+        (["rh","hr","recrutement","emploi","jobs"],                                 "RH"),
+        (["secretariat","admin","administration","assistante","assistant"],         "Administration"),
+    ]
+    for keywords, label in role_map:
+        if any(k in local for k in keywords):
+            return label
+    return "Équipe"
+
 def get_emails(text, excl):
     out = set()
     for m in EMAIL_RE.finditer(text):
-        e = m.group(0).lower().strip(".")
-        if not any(x in e.split("@")[-1] for x in excl):
+        e = m.group(0).lower().strip(".,;:")
+        dom = e.split("@")[-1]
+        if not any(x in dom for x in excl) and is_real_email(e):
             out.add(e)
     return out
 
 def get_phones(text):
     seen, out = set(), []
     for m in PHONE_RE.finditer(text):
-        p = re.sub(r"[\s.\-]","",m.group(0))
+        p = re.sub(r"[\s\.\-]","",m.group(0))
         if p not in seen: seen.add(p); out.append(p)
     return out
 
+# ── Multi-source web search — returns ALL emails found ─────────────────────
+def web_search_all_emails(dealer_name, dealer_addr, excl, log):
+    """
+    Search multiple sources for ALL emails related to this dealer.
+    Returns a set of validated emails.
+    """
+    found = set()
+    city = ""
+    if dealer_addr:
+        m = re.search(r"\d{5}\s+([A-ZÀ-Ÿa-zà-ÿ\s\-]+)", dealer_addr)
+        if m: city = m.group(1).strip().split()[0]
+
+    queries = [
+        f'"{dealer_name}" email',
+        f'"{dealer_name}" {city} contact email' if city else None,
+        f'"{dealer_name}" concessionnaire mail',
+        f'{dealer_name} {city} site:societe.com OR site:pages-jaunes.fr' if city else None,
+    ]
+    queries = [q for q in queries if q]
+
+    for q in queries:
+        try:
+            url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(q)
+            html = fetch(url, timeout=10)
+            # Extract only from result snippets and links, not page UI
+            clean = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.S)
+            clean = re.sub(r"<[^>]+>", " ", clean)
+            emails = get_emails(clean, excl)
+            found.update(emails)
+            if found:
+                break  # stop as soon as we find something
+            time.sleep(0.8)
+        except Exception as e:
+            log(f"  search erreur ({q[:30]}): {e}")
+            continue
+
+    # Try to also fetch the dealer website if an email was found
+    if found:
+        try:
+            domain = list(found)[0].split("@")[-1]
+            site_html = fetch(f"https://{domain}", timeout=8)
+            more = get_emails(site_html, excl)
+            # Only keep emails from same domain
+            more = {e for e in more if domain in e}
+            found.update(more)
+        except Exception:
+            pass
+
+    return {e for e in found if is_real_email(e)}
+
+# ── Page scraper ────────────────────────────────────────────────────────────
 def scrape(url, excl, log, send_progress):
     send_progress(5, "Chargement de la page…")
     log(f"GET {url}")
@@ -144,75 +237,132 @@ def scrape(url, excl, log, send_progress):
         soup = BeautifulSoup(html, "html.parser")
         for t in soup(["script","style","nav","footer","head"]): t.decompose()
 
+        # ── Strategy 1: try specific dealer-block selectors ──────────────
         blocks = []
-        for sel in ["[class*='dealer']","[class*='concess']","[class*='revendeur']",
-                    "[class*='reseau']","[class*='network']","[class*='store']",
-                    "[class*='location']","article",".card"]:
+        best_count = 0
+        for sel in [
+            "[class*='dealer']","[class*='concess']","[class*='revendeur']",
+            "[class*='reseau']","[class*='network']","[class*='store']",
+            "[class*='location']","[class*='point-vente']","[class*='retailer']",
+            "[class*='agency']","[class*='agence']","[class*='partner']",
+            "article","li.item","li.dealer","li.concessionnaire",
+            ".card",".box","[class*='item']","[class*='entry']",
+        ]:
             found = soup.select(sel)
-            if len(found) >= 3:
+            # Pick the selector that finds the MOST blocks (not just first ≥3)
+            if len(found) > best_count:
+                best_count = len(found)
                 blocks = found
                 log(f"Sélecteur '{sel}' → {len(found)} blocs")
-                break
-        if not blocks:
-            blocks = [d for d in soup.find_all(["div","li","article"]) if PHONE_RE.search(d.get_text())]
-            log(f"Fallback → {len(blocks)} blocs avec téléphone")
 
+        # ── Strategy 2: group by repeated phone pattern ───────────────────
+        if best_count < 5:
+            phone_blocks = [d for d in soup.find_all(["div","li","article","section"])
+                            if PHONE_RE.search(d.get_text())]
+            if len(phone_blocks) > best_count:
+                blocks = phone_blocks
+                log(f"Fallback téléphone → {len(blocks)} blocs")
+
+        # ── Strategy 3: find the deepest list/grid containing all dealers ─
+        if best_count < 5:
+            for tag in soup.find_all(["ul","ol","div"]):
+                children = tag.find_all(["li","div","article"], recursive=False)
+                if len(children) > best_count and all(
+                    PHONE_RE.search(c.get_text()) or EMAIL_RE.search(c.get_text())
+                    for c in children[:3]
+                ):
+                    blocks = children
+                    best_count = len(children)
+                    log(f"Grille détectée → {len(blocks)} blocs")
+
+        log(f"Total: {len(blocks)} blocs à analyser (sans limite)")
+
+        # ── Parse ALL blocks — NO [:100] limit ───────────────────────────
         seen = set()
-        for blk in blocks[:100]:
+        for blk in blocks:   # <-- NO LIMIT
             txt = blk.get_text(" ", strip=True)
-            if len(txt) < 15: continue
+            if len(txt) < 10: continue
+
+            # Extract name from heading tags first, then fallback
             name = ""
-            for t in blk.find_all(["h2","h3","h4","h5","strong","b"]):
+            for t in blk.find_all(["h1","h2","h3","h4","h5","strong","b","span"]):
                 v = t.get_text(strip=True)
-                if 4 < len(v) < 80: name = v; break
-            if not name: name = " ".join(txt.split()[:6])
-            key = name.lower()[:25]
-            if key in seen or len(name) < 4: continue
+                # Must look like a business name, not a phone/address
+                if 3 < len(v) < 90 and not PHONE_RE.match(v) and not v.isdigit():
+                    name = v; break
+            if not name:
+                # Take first meaningful line
+                for line in txt.split("  "):
+                    line = line.strip()
+                    if 3 < len(line) < 90 and not PHONE_RE.match(line):
+                        name = line; break
+            if not name: continue
+
+            # Skip phone-only rows
+            if re.match(r"^(t[eé]l\.?\s*:?\s*)[\d\s.\-\+]{6,}$", name.strip(), re.I): continue
+            # Skip rows that are just an address number
+            if re.match(r"^\d[\d\s,\-]+$", name.strip()): continue
+
+            key = name.lower()[:30]
+            if key in seen or len(name) < 3: continue
             seen.add(key)
+
             am = ADDR_RE.search(txt)
             addr = am.group(0).strip()[:100] if am else ""
+
             phones = get_phones(txt)
             phone = phones[0] if phones else ""
-            emails = get_emails(txt, excl)
+
+            # Collect ALL emails from block (visible text + mailto links)
+            page_emails = get_emails(txt, excl)
             for a in blk.find_all("a", href=True):
                 h = a["href"]
                 if h.startswith("mailto:"):
                     e = h[7:].split("?")[0].strip().lower()
-                    if e and not any(x in e.split("@")[-1] for x in excl): emails.add(e)
-            email = sorted(emails)[0] if emails else ""
-            dealers.append({"name":name[:80],"addr":addr,"phone":phone,
-                            "email":email,"src":"page" if email else "pending"})
+                    if is_real_email(e) and not any(x in e.split("@")[-1] for x in excl):
+                        page_emails.add(e)
+
+            emails_with_roles = {e: guess_role(e) for e in page_emails}
+            src = "page" if page_emails else "pending"
+            dealers.append({
+                "name": name[:80], "addr": addr, "phone": phone,
+                "emails": emails_with_roles,
+                "src": src,
+            })
+
     except ImportError:
         log("bs4 non disponible — mode regex")
-        clean = re.sub(r"<[^>]+"," ",html)
+        clean = re.sub(r"<[^>]+>"," ",html)
         clean = re.sub(r"\s+"," ",clean)
         phones = get_phones(clean)
-        emails = sorted(get_emails(clean, excl))
         used = set()
-        for ph in phones[:60]:
-            idx = clean.find(re.sub(r"[\s.\-]","",ph)[:6])
+        for ph in phones:  # NO LIMIT
+            idx = clean.find(re.sub(r"[\s\.\-]","",ph)[:6])
             if idx < 0: continue
-            ctx = clean[max(0,idx-150):idx+150]
+            ctx = clean[max(0,idx-200):idx+200]
             em_l = [e for e in get_emails(ctx,excl) if e not in used]
-            em = em_l[0] if em_l else ""
-            if em: used.add(em)
+            for em in em_l: used.add(em)
             nm = re.search(r"([A-ZÀ-Ÿ][a-zà-ÿ]+(?:\s+[A-ZÀ-Ÿa-zà-ÿ\-]+){1,4})", ctx)
             name = nm.group(1) if nm else f"Dealer {len(dealers)+1}"
-            dealers.append({"name":name[:80],"addr":"","phone":ph,
-                            "email":em,"src":"page" if em else "pending"})
+            # Skip duplicates
+            key = name.lower()[:25]
+            if key in {d["name"].lower()[:25] for d in dealers}: continue
+            dealers.append({
+                "name": name[:80], "addr": "", "phone": ph,
+                "emails": {em: guess_role(em) for em in em_l},
+                "src": "page" if em_l else "pending",
+            })
 
-    log(f"{len(dealers)} concessionnaires trouvés")
-    return dealers
+    # Final dedup by name similarity
+    final, seen_keys = [], set()
+    for d in dealers:
+        k = re.sub(r"[^a-z0-9]", "", d["name"].lower())[:20]
+        if k and k not in seen_keys:
+            seen_keys.add(k)
+            final.append(d)
 
-def web_search(name, excl, log):
-    try:
-        q = urllib.parse.quote(f'"{name}" email contact')
-        html = fetch(f"https://html.duckduckgo.com/html/?q={q}", timeout=10)
-        emails = get_emails(html, excl)
-        if emails: return sorted(emails)[0]
-    except Exception as e:
-        log(f"  web search erreur: {e}")
-    return ""
+    log(f"{len(final)} concessionnaires uniques trouvés en page")
+    return final
 
 
 class App(tk.Tk):
@@ -411,11 +561,11 @@ class App(tk.Tk):
         tf = tk.Frame(f, bg=WHITE)
         tf.pack(fill="both", expand=True, padx=16, pady=(0,14))
         self._tree = ttk.Treeview(tf,
-            columns=("num","name","addr","phone","email","src"),
+            columns=("num","name","addr","phone","email","src","role"),
             show="headings", selectmode="browse")
-        for col,w in [("num",40),("name",220),("addr",180),
-                      ("phone",110),("email",190),("src",90)]:
-            self._tree.column(col, width=w, minwidth=40)
+        for col,w in [("num",36),("name",200),("addr",160),
+                      ("phone",105),("email",185),("src",80),("role",110)]:
+            self._tree.column(col, width=w, minwidth=30)
         vsb = ttk.Scrollbar(tf, orient="vertical",   command=self._tree.yview)
         hsb = ttk.Scrollbar(tf, orient="horizontal", command=self._tree.xview)
         self._tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
@@ -474,9 +624,11 @@ class App(tk.Tk):
         for k,tk_key in [("s1","stat1"),("s2","stat2"),("s3","stat3"),("s4","stat4")]:
             self._slbl[k].configure(text=L(tk_key))
         # tree headings
+        role_lbl = {"FR":"Rôle","ES":"Rol","EN":"Role"}.get(self.lang,"Rôle")
         for col,key in [("num","col_num"),("name","col_name"),("addr","col_addr"),
                         ("phone","col_phone"),("email","col_email"),("src","col_src")]:
             self._tree.heading(col, text=L(key))
+        self._tree.heading("role", text=role_lbl)
         self._btn_copy.configure(text=L("btn_copy"))
         self._btn_csv.configure(text=L("btn_csv"))
         self._set_title.configure(text=L("set_title"))
@@ -524,17 +676,18 @@ class App(tk.Tk):
             self._set_prog(50, "Enrichissement…")
 
             if self._v1.get():
-                pending = [d for d in dealers if not d["email"]]
-                self._log_add(f"Recherche web pour {len(pending)} emails manquants…")
+                pending = [d for d in dealers if not d["emails"]]
+                self._log_add(f"Recherche web pour {len(pending)} concessionnaires sans email…")
                 for i,d in enumerate(pending):
                     pct = 50 + int(40*i/max(len(pending),1))
                     self._set_prog(pct, f"Recherche web {i+1}/{len(pending)}…")
                     self._log_add(f"  → {d['name'][:40]}")
-                    em = web_search(d["name"], excl, self._log_add)
-                    if em:
-                        d["email"] = em; d["src"] = "web"
-                        self._log_add(f"     ✓ {em}")
-                    time.sleep(1.0)
+                    found = web_search_all_emails(d["name"], d["addr"], excl, self._log_add)
+                    if found:
+                        d["emails"] = {e: guess_role(e) for e in found}
+                        d["src"] = "web"
+                        self._log_add(f"     ✓ {len(found)} email(s): {', '.join(sorted(found)[:3])}")
+                    time.sleep(1.2)
 
             if self._v2.get():
                 seen,uniq = set(),[]
@@ -544,8 +697,8 @@ class App(tk.Tk):
                 dealers = uniq
 
             self._set_prog(100, "Terminé !")
-            em = sum(1 for d in dealers if d["email"])
-            self._log_add(f"─── {len(dealers)} concessionnaires, {em} emails")
+            total_em = sum(len(d["emails"]) for d in dealers)
+            self._log_add(f"─── {len(dealers)} concessionnaires, {total_em} emails au total")
             self.results = dealers
             self.after(0, self._finish)
         except Exception as e:
@@ -557,7 +710,7 @@ class App(tk.Tk):
     def _finish(self):
         self._running = False
         d = self.results
-        em = sum(1 for x in d if x["email"])
+        em = sum(len(x["emails"]) for x in d)
         wb = sum(1 for x in d if x["src"]=="web")
         ad = sum(1 for x in d if x["addr"])
         self._sv["s1"].set(str(len(d)))
@@ -572,22 +725,37 @@ class App(tk.Tk):
 
     def _refresh_table(self):
         d = self.results
-        em = sum(1 for x in d if x["email"])
+        em = sum(len(x["emails"]) for x in d)
         ad = sum(1 for x in d if x["addr"])
         self._meta_lbl.configure(
             text=f"{len(d)} {self.L('stat1')} · {em} {self.L('stat2')} · {ad} {self.L('stat4')}")
         for row in self._tree.get_children(): self._tree.delete(row)
-        for i,x in enumerate(d,1):
-            sl = {
-                "page": self.L("src_page"),
-                "web":  self.L("src_web"),
-            }.get(x["src"], self.L("src_miss"))
-            tag = "miss" if not x["email"] else ("web" if x["src"]=="web" else "")
-            self._tree.insert("","end", tags=(tag,),
-                values=(i, x["name"], x["addr"], x["phone"], x["email"]or"—", sl))
+        row_num = 1
+        for x in d:
+            sl = {"page":self.L("src_page"),"web":self.L("src_web")}.get(x["src"],self.L("src_miss"))
+            if not x["emails"]:
+                # No emails found — one row
+                self._tree.insert("","end", tags=("miss",),
+                    values=(row_num, x["name"], x["addr"], x["phone"], "—", sl, "—"))
+                row_num += 1
+            else:
+                # One row per email found
+                for idx, (email, role) in enumerate(sorted(x["emails"].items())):
+                    tag = "" if x["src"]=="page" else "web"
+                    name_cell = x["name"] if idx==0 else ""
+                    addr_cell = x["addr"] if idx==0 else ""
+                    phone_cell = x["phone"] if idx==0 else ""
+                    src_cell = sl if idx==0 else ""
+                    self._tree.insert("","end", tags=(tag,),
+                        values=(row_num if idx==0 else "", name_cell, addr_cell,
+                                phone_cell, email, src_cell, role))
+                row_num += 1
 
     def _copy_emails(self):
-        em = [x["email"] for x in self.results if x["email"]]
+        em = []
+        for x in self.results:
+            em.extend(x["emails"].keys())
+        em = sorted(set(em))
         if not em: messagebox.showinfo("",self.L("no_copy")); return
         self.clipboard_clear(); self.clipboard_append("\n".join(em))
         messagebox.showinfo("✓", f"{len(em)} {self.L('copied')}")
@@ -599,15 +767,29 @@ class App(tk.Tk):
         os.makedirs(desk, exist_ok=True)
         fname = f"silence_dealers_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.csv"
         fpath = os.path.join(desk, fname)
+        date_str = datetime.now().strftime("%d/%m/%Y")
+        rows_written = 0
         with open(fpath,"w",newline="",encoding="utf-8-sig") as f:
             w = csv.writer(f)
-            w.writerow([self.L("col_name"),self.L("col_addr"),self.L("col_phone"),
-                        self.L("col_email"),self.L("col_src"),"Date"])
+            w.writerow([self.L("col_name"), self.L("col_addr"), self.L("col_phone"),
+                        self.L("col_email"), "Rôle / Role", self.L("col_src"), "Date"])
             for x in self.results:
                 sl = {"page":self.L("src_page"),"web":self.L("src_web")}.get(x["src"],self.L("src_miss"))
-                w.writerow([x["name"],x["addr"],x["phone"],x["email"],sl,
-                            datetime.now().strftime("%d/%m/%Y")])
-        messagebox.showinfo("✓", f"{self.L('export_ok')}\n{fname}\n\n{len(self.results)} lignes")
+                if not x["emails"]:
+                    w.writerow([x["name"],x["addr"],x["phone"],"","",sl,date_str])
+                    rows_written += 1
+                else:
+                    for idx,(email,role) in enumerate(sorted(x["emails"].items())):
+                        w.writerow([
+                            x["name"] if idx==0 else "",
+                            x["addr"] if idx==0 else "",
+                            x["phone"] if idx==0 else "",
+                            email, role,
+                            sl if idx==0 else "",
+                            date_str if idx==0 else "",
+                        ])
+                        rows_written += 1
+        messagebox.showinfo("✓", f"{self.L('export_ok')}\n{fname}\n\n{rows_written} lignes")
 
 if __name__ == "__main__":
     app = App()
