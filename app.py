@@ -239,7 +239,17 @@ def fetch(url, timeout=18, retries=3, referer="https://www.google.com"):
             driver = webdriver.Chrome(options=opts)
         driver.set_page_load_timeout(timeout)
         driver.get(url)
-        time.sleep(1.5)
+        # Wait for dynamic content (emails loaded via JS)
+        wait_time = 4 if "ligier" in url.lower() or "reseau" in url.lower() else 2
+        time.sleep(wait_time)
+        # Scroll to trigger lazy loading
+        try:
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
+            time.sleep(1)
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(1.5)
+        except Exception:
+            pass
         html = driver.page_source
         driver.quit()
         if html and len(html) > 3000:
@@ -541,12 +551,99 @@ def scrape_dealer_page(url, excl, log, prog, timeout=18, retries=3):
         if k and k not in seen2: seen2.add(k); final.append(d)
 
     log(f"✓ {len(final)} concessionnaires uniques")
+
+    # ── If 0 emails on main page: fetch individual dealer pages ───────────
+    no_email_count = sum(1 for d in final if not d["emails"])
+    if no_email_count == len(final) and len(final) > 0:
+        log(f"⚠ 0 email sur la page principale — scraping des fiches individuelles…")
+
+        base = re.match(r"https?://[^/]+", url)
+        base_url2 = base.group(0) if base else ""
+
+        def make_slug(name):
+            s = unicodedata.normalize("NFD", name.lower())
+            s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+            s = re.sub(r"[^a-z0-9\s]", " ", s)
+            s = re.sub(r"\s+", "-", s.strip()).strip("-")
+            return re.sub(r"-+", "-", s)
+
+        def fetch_fiche(dealer):
+            """Try multiple URL patterns for dealer individual page."""
+            name = dealer["name"]
+            slug = make_slug(name)
+            profile = dealer.get("profile_url", "")
+
+            # Try known URL patterns
+            candidates = []
+            if profile: candidates.append(profile)
+            candidates += [
+                f"{base_url2}/reseau/{slug}/",
+                f"{base_url2}/reseau/{slug}",
+                f"{base_url2}/network/{slug}/",
+            ]
+            # Also try slug without city (after last dash-word)
+            slug_short = "-".join(slug.split("-")[:-1]) if "-" in slug else slug
+            if slug_short != slug:
+                candidates.append(f"{base_url2}/reseau/{slug_short}/")
+
+            for candidate_url in candidates:
+                try:
+                    html = fetch(candidate_url, timeout=12, referer=url)
+                    if len(html) < 2000: continue
+                    from bs4 import BeautifulSoup
+                    soup = BeautifulSoup(html, "html.parser")
+                    txt  = soup.get_text(" ", strip=True)
+                    # Collect all emails — page emails are always valid
+                    emails = get_emails_raw(txt, excl)
+                    for a in soup.find_all("a", href=True):
+                        if a["href"].startswith("mailto:"):
+                            e = a["href"][7:].split("?")[0].strip().lower()
+                            if is_valid_email(e): emails.add(e)
+                    if emails:
+                        dealer["profile_url"] = candidate_url
+                        return {e: guess_role(e) for e in emails}
+                except Exception:
+                    continue
+            return {}
+
+        # Test on first 3 dealers to see if individual pages work
+        found_individual = False
+        for d in final[:3]:
+            result = fetch_fiche(d)
+            if result:
+                d["emails"] = result
+                d["src"] = "page"
+                log(f"  ✅ Fiche individuelle fonctionne: {d['name'][:35]} → {list(result.keys())[0]}")
+                found_individual = True
+                break
+
+        if found_individual:
+            log(f"  → Chargement de toutes les fiches individuelles ({len(final)})…")
+            import concurrent.futures
+            def process_fiche(d):
+                if not d["emails"]:
+                    result = fetch_fiche(d)
+                    if result:
+                        d["emails"] = result
+                        d["src"] = "page"
+                return d
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+                futures = {ex.submit(process_fiche, d): d for d in final if not d["emails"]}
+                done = 0
+                for future in concurrent.futures.as_completed(futures):
+                    done += 1
+                    if done % 10 == 0:
+                        log(f"  {done}/{len(futures)} fiches traitées…")
+                    time.sleep(0.1)
+
+            with_email = sum(1 for d in final if d["emails"])
+            log(f"  ✓ {with_email}/{len(final)} concessionnaires avec email via fiches")
+        else:
+            log(f"  ↳ Fiches individuelles inaccessibles — enrichissement web en fallback")
+
     return final
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-# EMAIL ENRICHMENT
-# ═════════════════════════════════════════════════════════════════════════════
 
 def search_emails_for_dealer(dealer, excl, log):
     """
@@ -864,6 +961,10 @@ def enrich_dealer(dealer, excl, log, delay=0.8, timeout=15):
 # ═════════════════════════════════════════════════════════════════════════════
 
 class App(tk.Tk):
+    """
+    Silence.eco Dealer Finder — Futuristic HUD Interface
+    Dark premium aesthetic with animated scan effects
+    """
     def __init__(self):
         super().__init__()
         self.lang    = "FR"
@@ -875,359 +976,585 @@ class App(tk.Tk):
         self.retries = tk.IntVar(value=3)
         self.inc_no  = tk.BooleanVar(value=True)
         self.open_csv= tk.BooleanVar(value=False)
-        self.configure(bg=C["dark"])
-        self.geometry("1080x720")
-        self.minsize(860, 600)
+        self._scan_angle = 0
+        self._pulse_step = 0
+        self._anim_running = False
+        self.configure(bg="#0A0A0B")
+        self.geometry("1100x740")
+        self.minsize(900,620)
+        self.title("Silence.eco — Dealer Finder")
         self._build()
-        self._lang()
+        self._apply_lang()
 
     def L(self, k): return STRINGS[self.lang].get(k, k)
 
-    # ── HEADER ────────────────────────────────────────────────────────────
+    # ══ BUILD ═════════════════════════════════════════════════════════════
     def _build(self):
-        # Header
-        hdr = tk.Frame(self, bg=C["dark"], pady=0)
+        self._mk_styles()
+        self._mk_header()
+        self._mk_body()
+
+    def _mk_styles(self):
+        s = ttk.Style(self); s.theme_use("clam")
+        s.configure("TNotebook", background="#0A0A0B", borderwidth=0, tabmargins=0)
+        s.configure("TNotebook.Tab", background="#111114", foreground="#555560",
+                    padding=[22,10], font=("Courier New",10,"bold"))
+        s.map("TNotebook.Tab",
+              background=[("selected","#1A1A1F")],
+              foreground=[("selected","#D01A20")])
+        s.configure("TFrame", background="#0A0A0B")
+        s.configure("Inner.TFrame", background="#111114")
+        s.configure("Scan.Horizontal.TProgressbar",
+                    troughcolor="#1A1A1F", background="#D01A20",
+                    borderwidth=0, thickness=3)
+        s.configure("Treeview", rowheight=30,
+                    font=("Courier New",9),
+                    background="#0D0D10",
+                    fieldbackground="#0D0D10",
+                    foreground="#C0C0CC")
+        s.configure("Treeview.Heading",
+                    font=("Courier New",8,"bold"),
+                    background="#111114",
+                    foreground="#D01A20",
+                    relief="flat")
+        s.map("Treeview",
+              background=[("selected","#1A0608")],
+              foreground=[("selected","#FF4444")])
+
+    def _mk_header(self):
+        hdr = tk.Frame(self, bg="#0A0A0B")
         hdr.pack(fill="x")
+        # Top red line
+        tk.Frame(hdr, bg="#D01A20", height=2).pack(fill="x")
+        # Corner accent
+        corner = tk.Frame(hdr, bg="#D01A20", width=4)
+        inner = tk.Frame(hdr, bg="#0A0A0B", pady=12)
+        inner.pack(fill="x", padx=0)
 
-        # Red accent line
-        tk.Frame(hdr, bg=C["red"], height=3).pack(fill="x")
+        left = tk.Frame(inner, bg="#0A0A0B")
+        left.pack(side="left", padx=20)
 
-        inner = tk.Frame(hdr, bg=C["dark"], pady=11)
-        inner.pack(fill="x", padx=20)
+        # Animated logo canvas
+        self._logo_cv = tk.Canvas(left, width=44, height=44,
+                                   bg="#0A0A0B", highlightthickness=0)
+        self._logo_cv.pack(side="left", padx=(0,14))
+        self._draw_logo()
 
-        left = tk.Frame(inner, bg=C["dark"])
-        left.pack(side="left")
+        # Brand text
+        brand = tk.Frame(left, bg="#0A0A0B")
+        brand.pack(side="left")
+        tk.Label(brand, text="SILENCE", bg="#0A0A0B", fg="#FFFFFF",
+                 font=("Courier New",18,"bold")).pack(anchor="w")
+        tk.Label(brand, text="ECO · DEALER FINDER SYSTEM v1.0",
+                 bg="#0A0A0B", fg="#D01A20",
+                 font=("Courier New",8)).pack(anchor="w")
 
-        # Logo hexagon
-        cv = tk.Canvas(left, width=36, height=36, bg=C["dark"], highlightthickness=0)
-        cv.pack(side="left", padx=(0,10))
-        cv.create_rectangle(0,0,36,36, fill=C["red"], outline="")
-        cv.create_polygon([18,3,30,10,30,26,18,33,6,26,6,10], outline=C["white"], fill="", width=1.5)
-        cv.create_oval(13,13,23,23, fill=C["white"], outline="")
+        # Right side
+        right = tk.Frame(inner, bg="#0A0A0B")
+        right.pack(side="right", padx=20)
 
-        tk.Label(left, text="SILENCE", bg=C["dark"], fg=C["white"],
-                 font=("Helvetica",17,"bold")).pack(side="left")
-        tk.Label(left, text="  ECO · DEALER FINDER", bg=C["dark"], fg=C["red"],
-                 font=("Helvetica",9)).pack(side="left")
+        # Status indicator
+        self._status_frame = tk.Frame(right, bg="#0A0A0B")
+        self._status_frame.pack(side="right", padx=(14,0))
+        self._status_dot = tk.Canvas(self._status_frame, width=8, height=8,
+                                      bg="#0A0A0B", highlightthickness=0)
+        self._status_dot.pack(side="left", padx=(0,6))
+        self._status_dot.create_oval(0,0,8,8, fill="#34C759", outline="")
+        self._status_lbl = tk.Label(self._status_frame, text="",
+                                     bg="#0A0A0B", fg="#555560",
+                                     font=("Courier New",9))
+        self._status_lbl.pack(side="left")
 
-        right = tk.Frame(inner, bg=C["dark"])
-        right.pack(side="right")
-        self._status_lbl = tk.Label(right, text="", bg=C["dark"], fg=C["muted"],
-                                     font=("Helvetica",10))
-        self._status_lbl.pack(side="left", padx=(0,16))
+        # Language buttons
         for code in ("FR","ES","EN"):
-            b = tk.Button(right, text=code, bg=C["dark2"], fg=C["white"],
-                          font=("Helvetica",9,"bold"), relief="flat", width=3,
-                          cursor="hand2", bd=0, pady=5, activebackground=C["red"],
+            b = tk.Button(right, text=code,
+                          bg="#111114", fg="#555560",
+                          font=("Courier New",8,"bold"),
+                          relief="flat", width=3, cursor="hand2",
+                          bd=0, pady=5,
+                          activebackground="#D01A20",
+                          activeforeground="#FFFFFF",
                           command=lambda c=code: self._switch(c))
             b.pack(side="left", padx=1)
 
-        self._mk_nb()
+        # Bottom divider with scan line effect
+        div = tk.Frame(hdr, bg="#1A1A1F", height=1)
+        div.pack(fill="x")
+        self._scan_line = tk.Frame(hdr, bg="#D01A20", height=1, width=0)
+        self._scan_line.place(x=0, y=0)  # will be animated
 
-    def _mk_nb(self):
-        s = ttk.Style(self); s.theme_use("clam")
-        s.configure("TNotebook", background=C["dark"], borderwidth=0, tabmargins=0)
-        s.configure("TNotebook.Tab", background=C["dark2"], foreground=C["muted"],
-                    padding=[18,9], font=("Helvetica",11))
-        s.map("TNotebook.Tab", background=[("selected",C["white"])],
-              foreground=[("selected",C["red"])])
-        s.configure("TFrame", background=C["white"])
-        s.configure("Silence.Horizontal.TProgressbar",
-                    troughcolor=C["border"], background=C["red"], thickness=4)
-        s.configure("Treeview", rowheight=28, font=("Helvetica",10),
-                    background=C["white"], fieldbackground=C["white"], foreground=C["dark"])
-        s.configure("Treeview.Heading", font=("Helvetica",9,"bold"),
-                    background=C["gray"], foreground=C["muted"])
-        s.map("Treeview", background=[("selected","#FFE5E6")],
-              foreground=[("selected",C["dark"])])
+    def _draw_logo(self):
+        cv = self._logo_cv
+        cv.delete("all")
+        # Hexagon background
+        cx, cy, r = 22, 22, 20
+        pts = []
+        import math
+        for i in range(6):
+            a = math.pi/2 + i*math.pi/3
+            pts += [cx + r*math.cos(a), cy + r*math.sin(a)]
+        cv.create_polygon(pts, fill="#D01A20", outline="")
+        # Inner hexagon
+        r2 = 14
+        pts2 = []
+        for i in range(6):
+            a = math.pi/2 + i*math.pi/3
+            pts2 += [cx + r2*math.cos(a), cy + r2*math.sin(a)]
+        cv.create_polygon(pts2, fill="#0A0A0B", outline="")
+        # Center dot
+        cv.create_oval(cx-5, cy-5, cx+5, cy+5, fill="#D01A20", outline="")
 
-        nb = ttk.Notebook(self); nb.pack(fill="both", expand=True)
-        self._f1=ttk.Frame(nb); self._f2=ttk.Frame(nb); self._f3=ttk.Frame(nb)
-        nb.add(self._f1,text=""); nb.add(self._f2,text=""); nb.add(self._f3,text="")
-        self._nb = nb
-        self._tab1(); self._tab2(); self._tab3()
+    def _mk_body(self):
+        self._nb = ttk.Notebook(self)
+        self._nb.pack(fill="both", expand=True, padx=0, pady=0)
+        self._f1 = ttk.Frame(self._nb)
+        self._f2 = ttk.Frame(self._nb)
+        self._f3 = ttk.Frame(self._nb)
+        self._nb.add(self._f1, text="")
+        self._nb.add(self._f2, text="")
+        self._nb.add(self._f3, text="")
+        self._tab1()
+        self._tab2()
+        self._tab3()
 
-    # ── TAB 1: EXTRACTION ─────────────────────────────────────────────────
+    # ══ TAB 1: EXTRACTION ════════════════════════════════════════════════
     def _tab1(self):
-        f = self._f1; P = dict(padx=24, pady=5)
+        f = self._f1
+        f.configure(style="TFrame")
 
-        # URL row
-        self._lbl_url = tk.Label(f, text="", bg=C["white"], fg=C["muted"],
-                                  font=("Helvetica",9,"bold"))
-        self._lbl_url.pack(anchor="w", padx=24, pady=(16,3))
+        # URL section
+        url_frame = tk.Frame(f, bg="#0A0A0B")
+        url_frame.pack(fill="x", padx=22, pady=(18,8))
 
-        row = tk.Frame(f, bg=C["white"]); row.pack(fill="x", **P)
+        self._lbl_url = tk.Label(url_frame, text="",
+                                  bg="#0A0A0B", fg="#555560",
+                                  font=("Courier New",8,"bold"))
+        self._lbl_url.pack(anchor="w", pady=(0,6))
+
+        row = tk.Frame(url_frame, bg="#0A0A0B")
+        row.pack(fill="x")
+
+        # URL entry with HUD style
+        entry_frame = tk.Frame(row, bg="#D01A20", padx=1, pady=1)
+        entry_frame.pack(side="left", fill="x", expand=True, padx=(0,10))
+        entry_inner = tk.Frame(entry_frame, bg="#0D0D10")
+        entry_inner.pack(fill="both")
+
         self._url = tk.StringVar(value="https://www.aixam.com/fr/reseau/voiture-sans-permis-france")
-        entry = tk.Entry(row, textvariable=self._url, font=("Helvetica",11),
-                 bg=C["gray"], relief="flat", bd=0,
-                 highlightthickness=1.5, highlightbackground=C["border"],
-                 highlightcolor=C["red"])
-        entry.pack(side="left", fill="x", expand=True, ipady=9, padx=(0,10))
-        self._btn = tk.Button(row, text="", bg=C["red"], fg=C["white"],
-                               font=("Helvetica",11,"bold"), relief="flat",
-                               cursor="hand2", bd=0, padx=20, pady=9,
-                               activebackground=C["red_d"],
+        self._url_entry = tk.Entry(entry_inner,
+                                    textvariable=self._url,
+                                    font=("Courier New",10),
+                                    bg="#0D0D10", fg="#E0E0E8",
+                                    insertbackground="#D01A20",
+                                    relief="flat", bd=0)
+        self._url_entry.pack(fill="x", padx=12, pady=9)
+
+        self._btn = tk.Button(row, text="",
+                               bg="#D01A20", fg="#FFFFFF",
+                               font=("Courier New",10,"bold"),
+                               relief="flat", cursor="hand2",
+                               bd=0, padx=22, pady=10,
+                               activebackground="#A01015",
+                               activeforeground="#FFFFFF",
                                command=self._start)
         self._btn.pack(side="left")
 
-        # Options
-        opt = tk.Frame(f, bg=C["white"]); opt.pack(fill="x", **P)
+        # Options row
+        opt = tk.Frame(f, bg="#0A0A0B")
+        opt.pack(fill="x", padx=22, pady=(4,8))
         self._v1=tk.BooleanVar(value=True)
         self._v2=tk.BooleanVar(value=True)
         self._v3=tk.BooleanVar(value=True)
-        self._c1=tk.Checkbutton(opt,text="",variable=self._v1,bg=C["white"],fg=C["dark"],
-                                  font=("Helvetica",10),activebackground=C["white"],
-                                  selectcolor=C["white"],cursor="hand2")
-        self._c2=tk.Checkbutton(opt,text="",variable=self._v2,bg=C["white"],fg=C["dark"],
-                                  font=("Helvetica",10),activebackground=C["white"],
-                                  selectcolor=C["white"],cursor="hand2")
-        self._c3=tk.Checkbutton(opt,text="",variable=self._v3,bg=C["white"],fg=C["dark"],
-                                  font=("Helvetica",10),activebackground=C["white"],
-                                  selectcolor=C["white"],cursor="hand2")
-        self._c1.pack(side="left",padx=(0,16))
-        self._c2.pack(side="left",padx=(0,16))
-        self._c3.pack(side="left")
+        for v,attr in [(self._v1,"_c1"),(self._v2,"_c2"),(self._v3,"_c3")]:
+            c = tk.Checkbutton(opt, text="", variable=v,
+                               bg="#0A0A0B", fg="#888890",
+                               font=("Courier New",9),
+                               activebackground="#0A0A0B",
+                               selectcolor="#0A0A0B",
+                               cursor="hand2",
+                               highlightthickness=0)
+            c.pack(side="left", padx=(0,18))
+            setattr(self, attr, c)
 
-        # Status indicators
-        ind = tk.Frame(f, bg=C["white"]); ind.pack(fill="x", padx=24, pady=(0,4))
-        self._hunter_ind = tk.Label(ind, text="⬤ Hunter.io : actif",
-                                     bg=C["white"], fg=C["green"], font=("Helvetica",9))
-        self._hunter_ind.pack(side="left")
+        # Hunter indicator
+        ind = tk.Frame(f, bg="#0A0A0B")
+        ind.pack(fill="x", padx=22, pady=(0,6))
+        self._h_dot = tk.Canvas(ind, width=8, height=8,
+                                 bg="#0A0A0B", highlightthickness=0)
+        self._h_dot.pack(side="left")
+        self._h_dot.create_oval(0,0,8,8, fill="#34C759", outline="")
+        self._hunter_lbl = tk.Label(ind, text="Hunter.io : ACTIF",
+                                     bg="#0A0A0B", fg="#34C759",
+                                     font=("Courier New",8,"bold"))
+        self._hunter_lbl.pack(side="left", padx=(6,0))
 
-        # Banner
-        banner = tk.Frame(f, bg=C["red_lt"]); banner.pack(fill="x", padx=24, pady=(0,8))
-        tk.Frame(banner, bg=C["red"], width=3).pack(side="left", fill="y")
-        self._desc_lbl = tk.Label(banner, text="", bg=C["red_lt"], fg="#7a0a0a",
-                                   font=("Helvetica",9), justify="left")
-        self._desc_lbl.pack(padx=12, pady=8, anchor="w")
+        # Info banner
+        banner = tk.Frame(f, bg="#0D0D10", pady=1)
+        banner.pack(fill="x", padx=22, pady=(0,10))
+        left_accent = tk.Frame(banner, bg="#D01A20", width=2)
+        left_accent.pack(side="left", fill="y")
+        self._desc_lbl = tk.Label(banner, text="",
+                                   bg="#0D0D10", fg="#555560",
+                                   font=("Courier New",8), justify="left")
+        self._desc_lbl.pack(padx=14, pady=7, anchor="w")
 
-        # Progress
-        pf = tk.Frame(f, bg=C["white"]); pf.pack(fill="x", **P)
-        self._prog_lbl = tk.Label(pf, text="", bg=C["white"], fg=C["dark"],
-                                   font=("Helvetica",10,"bold"))
-        self._prog_lbl.pack(anchor="w")
+        # Progress section with animated scanner
+        prog_frame = tk.Frame(f, bg="#0A0A0B")
+        prog_frame.pack(fill="x", padx=22, pady=(0,6))
+
+        # Status line
+        status_row = tk.Frame(prog_frame, bg="#0A0A0B")
+        status_row.pack(fill="x", pady=(0,6))
+        self._prog_icon = tk.Label(status_row, text="◈",
+                                    bg="#0A0A0B", fg="#D01A20",
+                                    font=("Courier New",10))
+        self._prog_icon.pack(side="left", padx=(0,8))
+        self._prog_lbl = tk.Label(status_row, text="",
+                                   bg="#0A0A0B", fg="#E0E0E8",
+                                   font=("Courier New",10,"bold"))
+        self._prog_lbl.pack(side="left")
+
+        # Progress bar container
+        pb_container = tk.Frame(prog_frame, bg="#1A1A1F", height=4)
+        pb_container.pack(fill="x")
+        pb_container.pack_propagate(False)
         self._prog_var = tk.DoubleVar()
-        ttk.Progressbar(pf, variable=self._prog_var, maximum=100,
-                        style="Silence.Horizontal.TProgressbar").pack(fill="x", pady=(3,0))
+        ttk.Progressbar(pb_container,
+                        variable=self._prog_var,
+                        maximum=100,
+                        style="Scan.Horizontal.TProgressbar").pack(fill="both", expand=True)
 
-        # Log
-        lf = tk.Frame(f, bg=C["white"]); lf.pack(fill="both", expand=True, **P)
-        self._log_hdr = tk.Label(lf, text="", bg=C["white"], fg=C["muted"],
-                                  font=("Helvetica",9,"bold"))
-        self._log_hdr.pack(anchor="w")
-        self._log = scrolledtext.ScrolledText(lf, height=7, font=("Courier New",9),
-                                               bg=C["gray"], fg=C["dark"], relief="flat",
-                                               bd=0, state="disabled", wrap="word",
-                                               highlightthickness=0)
-        self._log.pack(fill="both", expand=True, pady=(3,0))
+        # Animated scanner overlay
+        self._scanner_cv = tk.Canvas(prog_frame, bg="#0A0A0B",
+                                      height=3, highlightthickness=0)
+        self._scanner_cv.pack(fill="x", pady=(1,0))
 
-        # Stats
-        sf = tk.Frame(f, bg=C["white"]); sf.pack(fill="x", padx=24, pady=(4,16))
+        # Log section
+        log_hdr = tk.Frame(f, bg="#0A0A0B")
+        log_hdr.pack(fill="x", padx=22, pady=(8,4))
+        tk.Label(log_hdr, text="▸ ", bg="#0A0A0B", fg="#D01A20",
+                 font=("Courier New",9)).pack(side="left")
+        self._log_hdr = tk.Label(log_hdr, text="",
+                                  bg="#0A0A0B", fg="#555560",
+                                  font=("Courier New",8,"bold"))
+        self._log_hdr.pack(side="left")
+
+        log_container = tk.Frame(f, bg="#D01A20", padx=1, pady=1)
+        log_container.pack(fill="both", expand=True, padx=22)
+        self._log = scrolledtext.ScrolledText(
+            log_container,
+            height=8,
+            font=("Courier New",8),
+            bg="#060608", fg="#888890",
+            insertbackground="#D01A20",
+            relief="flat", bd=0,
+            state="disabled",
+            wrap="word",
+            highlightthickness=0)
+        self._log.pack(fill="both", expand=True)
+        self._log.tag_configure("ok",  foreground="#34C759")
+        self._log.tag_configure("err", foreground="#FF4444")
+        self._log.tag_configure("info",foreground="#888890")
+        self._log.tag_configure("src", foreground="#D01A20")
+
+        # Stats row
+        sf = tk.Frame(f, bg="#0A0A0B")
+        sf.pack(fill="x", padx=22, pady=(8,16))
         self._sv={}; self._slbl={}
-        for k in ("s1","s2","s3","s4"):
-            c = tk.Frame(sf, bg=C["gray"], padx=16, pady=10)
-            c.pack(side="left", fill="x", expand=True, padx=(0,8))
-            lbl=tk.Label(c,text="",bg=C["gray"],fg=C["muted"],font=("Helvetica",9))
+        colors = ["#FFFFFF","#D01A20","#34C759","#888890"]
+        for i,k in enumerate(("s1","s2","s3","s4")):
+            c = tk.Frame(sf, bg="#0D0D10", padx=14, pady=10)
+            c.pack(side="left", fill="x", expand=True, padx=(0,6 if i<3 else 0))
+            # Corner accent
+            tk.Frame(c, bg=C["red"] if k=="s2" else "#1A1A1F",
+                     width=2, height=30).pack(side="left", fill="y", pady=2)
+            right_c = tk.Frame(c, bg="#0D0D10")
+            right_c.pack(side="left", padx=(8,0))
+            lbl = tk.Label(right_c, text="", bg="#0D0D10",
+                           fg="#555560", font=("Courier New",7,"bold"))
             lbl.pack(anchor="w")
-            v=tk.StringVar(value="—"); col=C["red"] if k=="s2" else C["dark"]
-            tk.Label(c,textvariable=v,bg=C["gray"],fg=col,
-                     font=("Helvetica",24,"bold")).pack(anchor="w")
+            v = tk.StringVar(value="—")
+            tk.Label(right_c, textvariable=v, bg="#0D0D10",
+                     fg=colors[i],
+                     font=("Courier New",22,"bold")).pack(anchor="w")
             self._sv[k]=v; self._slbl[k]=lbl
 
-    # ── TAB 2: RESULTS ────────────────────────────────────────────────────
+    # ══ TAB 2: RESULTS ═══════════════════════════════════════════════════
     def _tab2(self):
         f = self._f2
-        top = tk.Frame(f, bg=C["white"]); top.pack(fill="x", padx=18, pady=10)
-        self._meta = tk.Label(top,text="",bg=C["white"],fg=C["muted"],font=("Helvetica",10))
+        top = tk.Frame(f, bg="#0A0A0B")
+        top.pack(fill="x", padx=18, pady=10)
+        self._meta = tk.Label(top, text="", bg="#0A0A0B",
+                               fg="#555560", font=("Courier New",8))
         self._meta.pack(side="left")
-        self._btn_csv=tk.Button(top,text="",bg=C["red"],fg=C["white"],
-                                 font=("Helvetica",10,"bold"),relief="flat",cursor="hand2",
-                                 bd=0,padx=14,pady=5,activebackground=C["red_d"],
-                                 command=self._export)
+
+        self._btn_csv = tk.Button(top, text="",
+                                   bg="#D01A20", fg="#FFFFFF",
+                                   font=("Courier New",9,"bold"),
+                                   relief="flat", cursor="hand2",
+                                   bd=0, padx=14, pady=5,
+                                   activebackground="#A01015",
+                                   command=self._export)
         self._btn_csv.pack(side="right")
-        self._btn_copy=tk.Button(top,text="",bg=C["white"],fg=C["dark"],
-                                  font=("Helvetica",10),relief="flat",bd=1,
-                                  cursor="hand2",padx=10,pady=5,
-                                  highlightbackground=C["border"],command=self._copy)
-        self._btn_copy.pack(side="right",padx=(0,8))
+        self._btn_copy = tk.Button(top, text="",
+                                    bg="#111114", fg="#888890",
+                                    font=("Courier New",9),
+                                    relief="flat", bd=0,
+                                    cursor="hand2", padx=10, pady=5,
+                                    command=self._copy)
+        self._btn_copy.pack(side="right", padx=(0,8))
 
-        tf=tk.Frame(f,bg=C["white"]); tf.pack(fill="both",expand=True,padx=18,pady=(0,14))
-        cols=("num","name","addr","phone","email","role","src")
-        self._tree=ttk.Treeview(tf,columns=cols,show="headings",selectmode="browse")
-        for col,w in [("num",36),("name",190),("addr",150),("phone",100),
-                      ("email",185),("role",145),("src",90)]:
-            self._tree.column(col,width=w,minwidth=30)
-        vsb=ttk.Scrollbar(tf,orient="vertical",command=self._tree.yview)
-        hsb=ttk.Scrollbar(tf,orient="horizontal",command=self._tree.xview)
-        self._tree.configure(yscrollcommand=vsb.set,xscrollcommand=hsb.set)
-        vsb.pack(side="right",fill="y"); hsb.pack(side="bottom",fill="x")
-        self._tree.pack(fill="both",expand=True)
-        self._tree.tag_configure("miss",   background="#FFF5F5")
-        self._tree.tag_configure("web",    background="#FFFBF0")
-        self._tree.tag_configure("hunter", background="#F0FFF4")
+        # Tree container with border
+        tf = tk.Frame(f, bg="#D01A20", padx=1, pady=1)
+        tf.pack(fill="both", expand=True, padx=18, pady=(0,14))
+        tree_inner = tk.Frame(tf, bg="#0D0D10")
+        tree_inner.pack(fill="both", expand=True)
 
-    # ── TAB 3: SETTINGS ───────────────────────────────────────────────────
+        cols = ("num","name","addr","phone","email","role","src")
+        self._tree = ttk.Treeview(tree_inner, columns=cols,
+                                   show="headings", selectmode="browse")
+        for col,w in [("num",36),("name",190),("addr",145),
+                      ("phone",95),("email",180),("role",140),("src",85)]:
+            self._tree.column(col, width=w, minwidth=30)
+        vsb = ttk.Scrollbar(tree_inner, orient="vertical",
+                             command=self._tree.yview)
+        hsb = ttk.Scrollbar(tree_inner, orient="horizontal",
+                             command=self._tree.xview)
+        self._tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
+        self._tree.pack(fill="both", expand=True)
+        self._tree.tag_configure("miss",   background="#0D0608")
+        self._tree.tag_configure("web",    background="#0D0D08")
+        self._tree.tag_configure("hunter", background="#080D08")
+
+    # ══ TAB 3: SETTINGS ══════════════════════════════════════════════════
     def _tab3(self):
         f = self._f3
-        canvas=tk.Canvas(f,bg=C["white"],highlightthickness=0)
-        vsb=ttk.Scrollbar(f,orient="vertical",command=canvas.yview)
+        canvas = tk.Canvas(f, bg="#0A0A0B", highlightthickness=0)
+        vsb = ttk.Scrollbar(f, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right",fill="y"); canvas.pack(fill="both",expand=True)
-        inner=tk.Frame(canvas,bg=C["white"])
-        win=canvas.create_window((0,0),window=inner,anchor="nw")
-        def _rsz(e): canvas.configure(scrollregion=canvas.bbox("all")); canvas.itemconfig(win,width=e.width)
-        canvas.bind("<Configure>",_rsz)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(fill="both", expand=True)
+        inner = tk.Frame(canvas, bg="#0A0A0B")
+        win = canvas.create_window((0,0), window=inner, anchor="nw")
+        def _rsz(e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfig(win, width=e.width)
+        canvas.bind("<Configure>", _rsz)
 
         def section(title):
-            fr=tk.Frame(inner,bg=C["white"]); fr.pack(fill="x",padx=24,pady=(18,0))
-            tk.Label(fr,text=title,bg=C["white"],fg=C["dark"],font=("Helvetica",11,"bold")).pack(anchor="w")
-            tk.Frame(fr,bg=C["border"],height=1).pack(fill="x",pady=(4,8))
+            fr = tk.Frame(inner, bg="#0A0A0B")
+            fr.pack(fill="x", padx=22, pady=(20,0))
+            hrow = tk.Frame(fr, bg="#0A0A0B")
+            hrow.pack(fill="x")
+            tk.Label(hrow, text="◈ ", bg="#0A0A0B", fg="#D01A20",
+                     font=("Courier New",9)).pack(side="left")
+            tk.Label(hrow, text=title, bg="#0A0A0B", fg="#FFFFFF",
+                     font=("Courier New",10,"bold")).pack(side="left")
+            tk.Frame(fr, bg="#1A1A1F", height=1).pack(fill="x", pady=(6,10))
             return fr
 
-        def spinrow(parent, lbl_key, desc_key, var, frm, to, step=1):
-            r=tk.Frame(parent,bg=C["white"]); r.pack(fill="x",padx=4,pady=4)
-            left=tk.Frame(r,bg=C["white"]); left.pack(side="left",fill="x",expand=True)
-            self._spin_labels.append(tk.Label(left,text=self.L(lbl_key),bg=C["white"],
-                                               fg=C["dark"],font=("Helvetica",10)))
-            self._spin_labels[-1].pack(anchor="w")
-            self._spin_descs.append(tk.Label(left,text=self.L(desc_key) if desc_key else "",
-                                              bg=C["white"],fg=C["muted"],font=("Helvetica",8)))
-            self._spin_descs[-1].pack(anchor="w")
-            sp=tk.Spinbox(r,textvariable=var,from_=frm,to=to,increment=step,
-                          width=6,font=("Helvetica",10),bg=C["gray"],relief="flat",
-                          bd=0,highlightthickness=1,highlightbackground=C["border"])
-            sp.pack(side="right",padx=(8,0),ipady=4)
+        def spinrow(parent, lbl_key, var, frm, to, step=1):
+            r = tk.Frame(parent, bg="#0A0A0B")
+            r.pack(fill="x", padx=4, pady=4)
+            tk.Label(r, text=self.L(lbl_key), bg="#0A0A0B",
+                     fg="#888890", font=("Courier New",9)).pack(side="left")
+            sp_frame = tk.Frame(r, bg="#D01A20", padx=1, pady=1)
+            sp_frame.pack(side="right")
+            sp = tk.Spinbox(sp_frame, textvariable=var,
+                            from_=frm, to=to, increment=step,
+                            width=5, font=("Courier New",9),
+                            bg="#0D0D10", fg="#E0E0E8",
+                            relief="flat", bd=0,
+                            buttonbackground="#1A1A1F",
+                            insertbackground="#D01A20")
+            sp.pack(ipady=4, padx=4)
 
-        self._spin_labels=[]; self._spin_descs=[]
+        s1 = section("RÉSEAU")
+        spinrow(s1, "p_delay",   self.delay,   0.3, 10, 0.1)
+        spinrow(s1, "p_timeout", self.timeout, 5,   60, 1)
+        spinrow(s1, "p_retries", self.retries, 1,   6,  1)
 
-        s1=section("Réseau"); spinrow(s1,"p_delay","",self.delay,0.3,10,0.1)
-        spinrow(s1,"p_timeout","",self.timeout,5,60,1)
-        spinrow(s1,"p_retries","",self.retries,1,6,1)
+        s2 = section("FILTRES")
+        tk.Label(s2, text=self.L("p_excl"), bg="#0A0A0B",
+                 fg="#888890", font=("Courier New",9)).pack(anchor="w", padx=4)
+        txt_frame = tk.Frame(s2, bg="#D01A20", padx=1, pady=1)
+        txt_frame.pack(fill="x", padx=4, pady=(4,4))
+        self._excl_txt = tk.Text(txt_frame, height=8,
+                                  font=("Courier New",8),
+                                  bg="#060608", fg="#888890",
+                                  insertbackground="#D01A20",
+                                  relief="flat", bd=0)
+        self._excl_txt.pack(fill="x", padx=4, pady=4)
+        self._excl_txt.insert("1.0", "\n".join(self.excl))
 
-        s2=section("Filtres")
-        tk.Label(s2,text=self.L("p_excl"),bg=C["white"],fg=C["dark"],
-                 font=("Helvetica",10)).pack(anchor="w",padx=4)
-        tk.Label(s2,text=self.L("p_excl_hint"),bg=C["white"],fg=C["muted"],
-                 font=("Helvetica",8)).pack(anchor="w",padx=4,pady=(0,4))
-        self._excl_txt=tk.Text(s2,height=8,font=("Courier New",9),
-                                bg=C["gray"],fg=C["dark"],relief="flat",bd=0,
-                                highlightthickness=1,highlightbackground=C["border"],
-                                highlightcolor=C["red"])
-        self._excl_txt.pack(fill="x",padx=4,pady=(0,4))
-        self._excl_txt.insert("1.0","\n".join(self.excl))
+        s3 = section("EXPORT")
+        for var, attr in [(self.inc_no,"_ck_no"),(self.open_csv,"_ck_open")]:
+            c = tk.Checkbutton(s3, text="", variable=var,
+                               bg="#0A0A0B", fg="#888890",
+                               font=("Courier New",9),
+                               activebackground="#0A0A0B",
+                               selectcolor="#0A0A0B",
+                               cursor="hand2")
+            c.pack(anchor="w", padx=4, pady=2)
+            setattr(self, attr, c)
 
-        s3=section("Export")
-        self._ck_no=tk.Checkbutton(s3,text=self.L("p_no_email"),variable=self.inc_no,
-                                    bg=C["white"],fg=C["dark"],font=("Helvetica",10),
-                                    activebackground=C["white"],selectcolor=C["white"],cursor="hand2")
-        self._ck_no.pack(anchor="w",padx=4,pady=2)
-        self._ck_open=tk.Checkbutton(s3,text=self.L("p_open"),variable=self.open_csv,
-                                      bg=C["white"],fg=C["dark"],font=("Helvetica",10),
-                                      activebackground=C["white"],selectcolor=C["white"],cursor="hand2")
-        self._ck_open.pack(anchor="w",padx=4,pady=2)
-
-        btn_row=tk.Frame(inner,bg=C["white"]); btn_row.pack(fill="x",padx=24,pady=14)
-        self._btn_save=tk.Button(btn_row,text="",bg=C["red"],fg=C["white"],
-                                  font=("Helvetica",10,"bold"),relief="flat",cursor="hand2",
-                                  bd=0,padx=14,pady=7,activebackground=C["red_d"],
-                                  command=self._save)
+        btn_row = tk.Frame(inner, bg="#0A0A0B")
+        btn_row.pack(fill="x", padx=22, pady=16)
+        self._btn_save = tk.Button(btn_row, text="",
+                                    bg="#D01A20", fg="#FFFFFF",
+                                    font=("Courier New",9,"bold"),
+                                    relief="flat", cursor="hand2",
+                                    bd=0, padx=14, pady=7,
+                                    activebackground="#A01015",
+                                    command=self._save)
         self._btn_save.pack(side="left")
-        self._btn_rst=tk.Button(btn_row,text="",bg=C["white"],fg=C["muted"],
-                                 font=("Helvetica",10),relief="flat",bd=1,cursor="hand2",
-                                 padx=10,pady=7,highlightbackground=C["border"],
-                                 command=self._reset)
-        self._btn_rst.pack(side="left",padx=(8,0))
+        self._btn_rst = tk.Button(btn_row, text="",
+                                   bg="#111114", fg="#555560",
+                                   font=("Courier New",9),
+                                   relief="flat", bd=0,
+                                   cursor="hand2", padx=10, pady=7,
+                                   command=self._reset)
+        self._btn_rst.pack(side="left", padx=(8,0))
 
-    # ── LANGUAGE ──────────────────────────────────────────────────────────
-    def _switch(self, lang): self.lang=lang; self._lang()
+    # ══ ANIMATIONS ════════════════════════════════════════════════════════
+    def _start_anim(self):
+        self._anim_running = True
+        self._animate()
 
-    def _lang(self):
-        L=self.L; self.title(L("title"))
-        self._nb.tab(0,text=L("tab_ex"))
-        self._nb.tab(1,text=L("tab_re"))
-        self._nb.tab(2,text=L("tab_se"))
-        self._lbl_url.configure(text=L("url_lbl"))
-        self._btn.configure(text=L("btn_go") if not self._run else L("btn_run"))
+    def _stop_anim(self):
+        self._anim_running = False
+
+    def _animate(self):
+        if not self._anim_running: return
+        # Pulse the progress icon
+        icons = ["◈","◉","◎","◉"]
+        self._pulse_step = (self._pulse_step + 1) % len(icons)
+        try:
+            self._prog_icon.configure(text=icons[self._pulse_step])
+        except Exception: pass
+        # Scan line animation across header
+        try:
+            w = self.winfo_width()
+            self._scan_angle = (self._scan_angle + 3) % 100
+            x = int(w * self._scan_angle / 100)
+            # Draw scanner on log area
+            cv = self._scanner_cv
+            cw = cv.winfo_width()
+            cv.delete("all")
+            scan_x = int(cw * self._scan_angle / 100)
+            cv.create_line(scan_x, 0, scan_x+40, 0,
+                          fill="#D01A20", width=2)
+            cv.create_line(scan_x, 0, scan_x, 3,
+                          fill="#FF4444", width=1)
+        except Exception: pass
+        # Color-code log lines
+        self.after(80, self._animate)
+
+    # ══ LANGUAGE ══════════════════════════════════════════════════════════
+    def _switch(self, lang): self.lang=lang; self._apply_lang()
+
+    def _apply_lang(self):
+        L = self.L
+        self.title(L("title"))
+        self._nb.tab(0, text=f"  {L('tab_ex')}  ")
+        self._nb.tab(1, text=f"  {L('tab_re')}  ")
+        self._nb.tab(2, text=f"  {L('tab_se')}  ")
+        self._lbl_url.configure(text=L("url_lbl").upper())
+        self._btn.configure(text=f"[ {L('btn_go')} ]" if not self._run
+                            else f"[ {L('btn_run')} ]")
         self._c1.configure(text=L("opt1"))
         self._c2.configure(text=L("opt2"))
         self._c3.configure(text=L("opt3"))
         self._desc_lbl.configure(text=L("desc"))
-        self._log_hdr.configure(text=L("log_hdr"))
+        self._log_hdr.configure(text=L("log_hdr").upper())
         for k,tk_k in [("s1","st1"),("s2","st2"),("s3","st3"),("s4","st4")]:
-            self._slbl[k].configure(text=L(tk_k))
-        rl={"FR":"Rôle","ES":"Rol","EN":"Role"}.get(self.lang,"Rôle")
+            self._slbl[k].configure(text=L(tk_k).upper())
+        rl = {"FR":"RÔLE","ES":"ROL","EN":"ROLE"}.get(self.lang,"RÔLE")
         for col,key in [("num","c_num"),("name","c_name"),("addr","c_addr"),
                         ("phone","c_phone"),("email","c_email"),("src","c_src")]:
-            self._tree.heading(col,text=L(key))
-        self._tree.heading("role",text=rl)
-        self._btn_copy.configure(text=L("btn_copy"))
-        self._btn_csv.configure(text=L("btn_csv"))
-        self._btn_save.configure(text=L("btn_save"))
-        self._btn_rst.configure(text=L("btn_reset"))
-        self._status_lbl.configure(text=L("ready"))
+            self._tree.heading(col, text=L(key).upper())
+        self._tree.heading("role", text=rl)
+        self._btn_copy.configure(text=f"[ {L('btn_copy')} ]")
+        self._btn_csv.configure(text=f"[ {L('btn_csv')} ]")
+        self._btn_save.configure(text=f"[ {L('btn_save')} ]")
+        self._btn_rst.configure(text=f"[ {L('btn_reset')} ]")
         self._ck_no.configure(text=L("p_no_email"))
         self._ck_open.configure(text=L("p_open"))
+        self._status_lbl.configure(text=L("ready").upper())
         if self.results: self._render()
 
-    # ── LOGIC ─────────────────────────────────────────────────────────────
+    # ══ LOG ═══════════════════════════════════════════════════════════════
     def _log_add(self, msg):
         self._log.configure(state="normal")
-        self._log.insert("end", f"▸ {msg}\n")
+        # Color based on content
+        if "✅" in msg or "✔" in msg or "✓" in msg:
+            tag = "ok"
+        elif "✗" in msg or "ERREUR" in msg or "rejeté" in msg:
+            tag = "err"
+        elif "🔍" in msg or "🗺" in msg or "💡" in msg:
+            tag = "src"
+        else:
+            tag = "info"
+        self._log.insert("end", f"  {msg}\n", tag)
         self._log.see("end")
         self._log.configure(state="disabled")
 
     def _set_prog(self, pct, lbl=""):
         self._prog_var.set(pct)
-        if lbl: self._prog_lbl.configure(text=lbl)
+        if lbl:
+            # Add scanline prefix for futuristic feel
+            self._prog_lbl.configure(text=lbl)
         self.update_idletasks()
 
+    # ══ ACTIONS ═══════════════════════════════════════════════════════════
     def _save(self):
         raw = self._excl_txt.get("1.0","end").strip()
         self.excl = [l.strip().lstrip("@") for l in raw.splitlines() if l.strip()]
-        messagebox.showinfo("✓", self.L("saved"))
+        messagebox.showinfo("SILENCE · SYSTEM", self.L("saved"))
 
     def _reset(self):
         self.excl = list(EXCL_DEFAULT)
-        self._excl_txt.delete("1.0","end"); self._excl_txt.insert("1.0","\n".join(self.excl))
+        self._excl_txt.delete("1.0","end")
+        self._excl_txt.insert("1.0","\n".join(self.excl))
         self.delay.set(0.8); self.timeout.set(18); self.retries.set(3)
         self.inc_no.set(True); self.open_csv.set(False)
-        messagebox.showinfo("✓", self.L("reset"))
+        messagebox.showinfo("SILENCE · SYSTEM", self.L("reset"))
 
     def _start(self):
         if self._run: return
         url = self._url.get().strip()
         if not url.startswith("http"):
-            messagebox.showerror("", self.L("err_url")); return
+            messagebox.showerror("ERROR", self.L("err_url")); return
         self._run = True
-        self._btn.configure(state="disabled", text=self.L("btn_run"))
-        self._log.configure(state="normal"); self._log.delete("1.0","end")
+        self._btn.configure(state="disabled",
+                             text=f"[ {self.L('btn_run')} ]")
+        self._log.configure(state="normal")
+        self._log.delete("1.0","end")
         self._log.configure(state="disabled")
-        self._set_prog(0, "")
+        self._set_prog(0,"")
         for v in self._sv.values(): v.set("—")
+        # Start animation
+        self._start_anim()
         excl = self.excl if self._v3.get() else []
         threading.Thread(target=self._worker, args=(url,excl), daemon=True).start()
 
     def _worker(self, url, excl):
         try:
-            to = self.timeout.get(); rt = self.retries.get(); dly = self.delay.get()
-
-            dealers = scrape_dealer_page(url, excl, self._log_add, self._set_prog,
-                                          timeout=to, retries=rt)
-            self._set_prog(44, "Enrichissement emails…")
-
+            to=self.timeout.get(); rt=self.retries.get(); dly=self.delay.get()
+            dealers = scrape_dealer_page(url, excl, self._log_add,
+                                          self._set_prog, timeout=to, retries=rt)
+            self._set_prog(44,"Enrichissement…")
             if self._v1.get():
-                # All dealers go through enrichment:
-                # - Those WITH emails: skip web search, only do Hunter
-                # - Those WITHOUT emails: full web search pipeline
-                pending = dealers  # process all for Hunter at minimum
-                no_email = sum(1 for d in dealers if not d["emails"])
-                has_email = len(dealers) - no_email
-                self._log_add(f"━━━ {len(dealers)} concessionnaires ━━━")
-                self._log_add(f"  {has_email} avec email(s) → enrichissement Hunter seulement")
-                self._log_add(f"  {no_email} sans email → recherche web complète")
+                pending = dealers
+                no_em = sum(1 for d in dealers if not d["emails"])
+                has_em = len(dealers) - no_em
+                self._log_add(f"━━ {len(dealers)} concessionnaires ━━")
+                self._log_add(f"  {has_em} avec email(s) → Hunter seulement")
+                self._log_add(f"  {no_em} sans email → recherche complète")
                 lock = threading.Lock()
                 done = [0]
-
                 def do_one(d):
                     try:
                         em, src = enrich_dealer(d, excl, self._log_add,
@@ -1238,60 +1565,66 @@ class App(tk.Tk):
                     finally:
                         with lock:
                             done[0] += 1
-                            pct = 44 + int(50 * done[0] / max(len(pending),1))
-                            self._set_prog(pct, f"{done[0]}/{len(pending)} — {d['name'][:28]}")
-
-                # 4 parallel threads
-                threads = []
+                            pct = 44+int(50*done[0]/max(len(pending),1))
+                            self._set_prog(pct,
+                                f"{done[0]}/{len(pending)} — {d['name'][:28]}")
+                threads=[]
                 for d in pending:
-                    t = threading.Thread(target=do_one, args=(d,), daemon=True)
+                    t=threading.Thread(target=do_one,args=(d,),daemon=True)
                     threads.append(t); t.start()
-                    while len([x for x in threads if x.is_alive()]) >= 4:
+                    while len([x for x in threads if x.is_alive()])>=4:
                         time.sleep(0.3)
                 for t in threads: t.join(timeout=40)
-
             if self._v2.get():
-                seen, uniq = set(), []
+                seen,uniq=set(),[]
                 for d in dealers:
-                    k = norm(d["name"])[:20]
+                    k=norm(d["name"])[:20]
                     if k not in seen: seen.add(k); uniq.append(d)
-                dealers = uniq
-
-            self._set_prog(100, "Terminé !")
-            total = sum(len(d["emails"]) for d in dealers)
-            self._log_add(f"━━━ {len(dealers)} concessionnaires · {total} emails validés ━━━")
-            self.results = dealers
+                dealers=uniq
+            self._set_prog(100,"✓ EXTRACTION TERMINÉE")
+            total=sum(len(d["emails"]) for d in dealers)
+            self._log_add(f"━━ {len(dealers)} concessionnaires · {total} emails validés ━━")
+            self.results=dealers
             self.after(0, self._finish)
-
         except Exception as e:
-            self.after(0, lambda: messagebox.showerror("Erreur", str(e)))
-            self._log_add(f"ERREUR: {e}")
-            self.after(0, lambda: self._btn.configure(state="normal", text=self.L("btn_go")))
-            self._run = False
+            self.after(0,lambda:messagebox.showerror("ERROR",str(e)))
+            self._log_add(f"✗ ERREUR CRITIQUE: {e}")
+            self.after(0,lambda: self._btn.configure(
+                state="normal",text=f"[ {self.L('btn_go')} ]"))
+            self._run=False
+            self._stop_anim()
 
     def _finish(self):
-        self._run = False
-        d = self.results
-        em = sum(len(x["emails"]) for x in d)
-        wb = sum(1 for x in d if x["src"] in ("web","hunter"))
-        ad = sum(1 for x in d if x["addr"])
-        self._sv["s1"].set(str(len(d))); self._sv["s2"].set(str(em))
-        self._sv["s3"].set(str(wb));     self._sv["s4"].set(str(ad))
-        self._btn.configure(state="normal", text=self.L("btn_again"))
-        self._status_lbl.configure(text=self.L("last")+datetime.now().strftime("%H:%M"))
+        self._run=False
+        self._stop_anim()
+        self._prog_icon.configure(text="◈")
+        d=self.results
+        em=sum(len(x["emails"]) for x in d)
+        wb=sum(1 for x in d if x["src"] in ("web","hunter"))
+        ad=sum(1 for x in d if x["addr"])
+        self._sv["s1"].set(str(len(d)))
+        self._sv["s2"].set(str(em))
+        self._sv["s3"].set(str(wb))
+        self._sv["s4"].set(str(ad))
+        self._btn.configure(state="normal",
+                             text=f"[ {self.L('btn_again')} ]")
+        self._status_lbl.configure(
+            text=(self.L("last")+datetime.now().strftime("%H:%M")).upper())
         self._render()
         self._nb.select(self._f2)
 
     def _render(self):
-        d = self.results
-        em=sum(len(x["emails"]) for x in d); ad=sum(1 for x in d if x["addr"])
-        sm={"page":self.L("s_page"),"web":self.L("s_web"),"hunter":self.L("s_hunter")}
+        d=self.results
+        em=sum(len(x["emails"]) for x in d)
+        ad=sum(1 for x in d if x["addr"])
+        sm={"page":self.L("s_page"),"web":self.L("s_web"),
+            "hunter":self.L("s_hunter")}
         self._meta.configure(
-            text=f"{len(d)} {self.L('st1')} · {em} {self.L('st2')} · {ad} {self.L('st4')}")
+            text=f"{len(d)} {self.L('st1').upper()} · {em} {self.L('st2').upper()} · {ad} {self.L('st4').upper()}")
         for r in self._tree.get_children(): self._tree.delete(r)
-        n = 1
+        n=1
         for x in d:
-            sl = sm.get(x["src"],"—")
+            sl=sm.get(x["src"],"—")
             if not x["emails"]:
                 self._tree.insert("","end",tags=("miss",),
                     values=(n,x["name"],x["addr"],x["phone"],"—","—",sl)); n+=1
@@ -1305,31 +1638,34 @@ class App(tk.Tk):
                         x["phone"] if i==0 else "",
                         email, role, sl if i==0 else "",
                     ))
-                n += 1
+                n+=1
 
     def _copy(self):
-        em = sorted({e for x in self.results for e in x["emails"]})
-        if not em: messagebox.showinfo("", self.L("no_copy")); return
+        em=sorted({e for x in self.results for e in x["emails"]})
+        if not em: messagebox.showinfo("",self.L("no_copy")); return
         self.clipboard_clear(); self.clipboard_append("\n".join(em))
-        messagebox.showinfo("✓", f"{len(em)}{self.L('copied')}")
+        messagebox.showinfo("✓",f"{len(em)}{self.L('copied')}")
 
     def _export(self):
-        if not self.results: messagebox.showinfo("", self.L("no_copy")); return
-        desk = os.path.join(os.path.expanduser("~"), "Desktop")
-        os.makedirs(desk, exist_ok=True)
-        fname = f"silence_dealers_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.csv"
-        fpath = os.path.join(desk, fname)
-        sm={"page":self.L("s_page"),"web":self.L("s_web"),"hunter":self.L("s_hunter")}
-        date_s = datetime.now().strftime("%d/%m/%Y"); rows = 0
-        with open(fpath,"w",newline="",encoding="utf-8-sig") as f:
-            w = csv.writer(f)
+        if not self.results: messagebox.showinfo("",self.L("no_copy")); return
+        desk=os.path.join(os.path.expanduser("~"),"Desktop")
+        os.makedirs(desk,exist_ok=True)
+        fname=f"silence_dealers_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.csv"
+        fpath=os.path.join(desk,fname)
+        sm={"page":self.L("s_page"),"web":self.L("s_web"),
+            "hunter":self.L("s_hunter")}
+        date_s=datetime.now().strftime("%d/%m/%Y"); rows=0
+        with open(fpath,"w",newline="",encoding="utf-8-sig") as fp:
+            w=csv.writer(fp)
             w.writerow([self.L("c_name"),self.L("c_addr"),self.L("c_phone"),
-                        self.L("c_email"),self.L("c_role"),"Site web",self.L("c_src"),"Date"])
+                        self.L("c_email"),self.L("c_role"),
+                        "Site web",self.L("c_src"),"Date"])
             for x in self.results:
                 if not x["emails"] and not self.inc_no.get(): continue
                 sl=sm.get(x["src"],"—"); site=x.get("website","")
                 if not x["emails"]:
-                    w.writerow([x["name"],x["addr"],x["phone"],"","",site,sl,date_s]); rows+=1
+                    w.writerow([x["name"],x["addr"],x["phone"],
+                                "","",site,sl,date_s]); rows+=1
                 else:
                     for i,(email,role) in enumerate(sorted(x["emails"].items())):
                         w.writerow([
@@ -1341,13 +1677,13 @@ class App(tk.Tk):
                             sl         if i==0 else "",
                             date_s     if i==0 else "",
                         ]); rows+=1
-        messagebox.showinfo("✓", f"{self.L('exp_ok')}\n{fname}\n\n{rows}{self.L('exp_rows')}")
+        messagebox.showinfo("✓",
+            f"{self.L('exp_ok')}\n{fname}\n\n{rows}{self.L('exp_rows')}")
         if self.open_csv.get():
             try: os.startfile(fpath)
             except Exception:
                 try: os.system(f'open "{fpath}"')
                 except Exception: pass
-
 
 if __name__ == "__main__":
     App().mainloop()
