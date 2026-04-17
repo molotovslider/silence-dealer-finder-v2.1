@@ -10,8 +10,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install pyinstaller beautifulsoup4
-      - run: pyinstaller --onefile --windowed --name SilenceDealerFinder app.py
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller beautifulsoup4 requests playwright
+          python -m playwright install chromium
+          python -m playwright install-deps chromium
+      - name: Build EXE
+        run: |
+          pyinstaller --onefile --windowed --name SilenceDealerFinder `
+            --hidden-import=playwright `
+            --hidden-import=bs4 `
+            --hidden-import=requests `
+            --collect-all playwright `
+            app.py
       - uses: actions/upload-artifact@v4
         with:
           name: SilenceDealerFinder-Windows
@@ -24,8 +35,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install pyinstaller beautifulsoup4
-      - run: pyinstaller --onefile --windowed --name SilenceDealerFinder app.py
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller beautifulsoup4 requests playwright
+          python -m playwright install chromium
+      - name: Build MAC
+        run: |
+          pyinstaller --onefile --windowed --name SilenceDealerFinder \
+            --hidden-import=playwright \
+            --hidden-import=bs4 \
+            --hidden-import=requests \
+            --collect-all playwright \
+            app.py
       - uses: actions/upload-artifact@v4
         with:
           name: SilenceDealerFinder-Mac
