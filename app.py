@@ -368,6 +368,7 @@ def find_dealer_domain(name, addr, log, delay=0.5):
     ]
     for q in queries:
         try:
+            log(f"  🌐 Recherche site: {q[:55]}")
             url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(q)
             html = fetch(url, timeout=15, ref="https://duckduckgo.com")
             for href in re.findall(r'href="(https?://[^"&]{8,})"', html):
@@ -406,11 +407,7 @@ def scrape_domain_emails(domain, excl, log, timeout=12):
 
 # ── Enrichissement complet ────────────────────────────────────────────────────
 def google_search_emails(name, addr, excl, log):
-    """
-    Search Google/DuckDuckGo for emails directly.
-    Strategy: "DEALER NAME email" → grab emails from snippets.
-    Much faster than finding website first.
-    """
+    """Search DuckDuckGo for emails: fastest method."""
     found = set()
     city = ""
     if addr:
@@ -426,52 +423,80 @@ def google_search_emails(name, addr, excl, log):
 
     for q in [x for x in queries if x]:
         try:
+            log(f"  🔍 Recherche: {q[:60]}")
             url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(q)
             html = fetch(url, timeout=12, ref="https://duckduckgo.com")
-            # Strip HTML tags, keep text
             clean = re.sub(r"<[^>]+>", " ", html)
             clean = re.sub(r"\s+", " ", clean)
             emails = get_emails(clean, excl)
             if emails:
                 found.update(emails)
-                log(f"  Google: {len(emails)} email(s) pour '{name[:30]}'")
+                for e in sorted(emails):
+                    log(f"  ✅ Email trouvé: {e}")
                 break
+            else:
+                log(f"  ↳ Aucun email dans les résultats")
             time.sleep(random.uniform(0.3, 0.8))
         except Exception as e:
-            log(f"  Search err: {str(e)[:40]}")
+            log(f"  ⚠️ Erreur recherche: {str(e)[:50]}")
     return found
 
 
 def enrich_dealer(dealer, excl, log, delay=0.8, timeout=15):
     """
-    Enrichment pipeline (fast first, deep if needed):
+    Enrichment pipeline:
     1. Direct Google search "name email" → fastest
     2. Find dealer website → scrape emails
-    3. Hunter.io on domain → professional contacts
+    3. Hunter.io on domain → professional contacts with names
     """
     all_em = dict(dealer.get("emails", {}))
     src    = dealer.get("src", "pending")
+    name   = dealer["name"]
 
-    # ── Step 1: Direct Google search (fastest) ────────────────────────────
-    direct = google_search_emails(dealer["name"], dealer["addr"], excl, log)
+    log(f"┌─ {name[:50]}")
+
+    # ── Étape 1 : Recherche directe Google ───────────────────────────────
+    log(f"│  Étape 1/3 — Recherche Google directe")
+    direct = google_search_emails(name, dealer["addr"], excl, log)
     if direct:
         for e in direct:
             if e not in all_em: all_em[e] = guess_role(e)
         src = "web"
+        log(f"│  → {len(direct)} email(s) trouvé(s) via Google")
+    else:
+        log(f"│  → Aucun email trouvé via Google")
 
-    # ── Step 2: Find dealer's own website + scrape ────────────────────────
-    domain = find_dealer_domain(dealer["name"], dealer["addr"], log, delay)
+    # ── Étape 2 : Site web du concessionnaire ────────────────────────────
+    log(f"│  Étape 2/3 — Recherche du site web")
+    domain = find_dealer_domain(name, dealer["addr"], log, delay)
     if domain:
         dealer["website"] = domain
+        log(f"│  → Site trouvé: {domain}")
+        log(f"│  Scraping du site web…")
         scraped = scrape_domain_emails(domain, excl, log, timeout)
-        for e in scraped:
-            if e not in all_em: all_em[e] = guess_role(e)
-        if scraped and src == "pending": src = "web"
+        if scraped:
+            for e in scraped:
+                if e not in all_em: all_em[e] = guess_role(e)
+            if src == "pending": src = "web"
+            log(f"│  → {len(scraped)} email(s) depuis le site")
+        else:
+            log(f"│  → Aucun email sur le site")
 
-        # ── Step 3: Hunter.io (richest data: name + position) ─────────────
+        # ── Étape 3 : Hunter.io ──────────────────────────────────────────
+        log(f"│  Étape 3/3 — Hunter.io ({domain})")
         h = hunter_search(domain, excl, log, timeout)
-        all_em.update(h)  # Hunter overrides with better role info
-        if h: src = "hunter"
+        if h:
+            all_em.update(h)
+            src = "hunter"
+            log(f"│  → {len(h)} contact(s) Hunter.io")
+        else:
+            log(f"│  → Aucun résultat Hunter.io")
+    else:
+        log(f"│  → Site web non trouvé")
+        log(f"│  Étape 3/3 — Hunter.io ignoré (pas de domaine)")
+
+    total = len([e for e in all_em if is_real(e)])
+    log(f"└─ Total: {total} email(s) — Source: {src}")
 
     return {e: r for e, r in all_em.items() if is_real(e)}, src
 
@@ -1009,7 +1034,10 @@ class App(tk.Tk):
 
             if self._v1.get():
                 pending=[d for d in dealers if not d["emails"]]
-                self._log_add(f"Enrichissement: {len(pending)} concessionnaires sans email…")
+                self._log_add(f"━━━ Enrichissement de {len(pending)} concessionnaires ━━━")
+                self._log_add(f"Pipeline: Google → Site web → Hunter.io")
+                self._log_add(f"4 concessionnaires traités en parallèle")
+                self._log_add(f"─────────────────────────────────────────")
                 done_count = [0]
                 lock = threading.Lock()
 
