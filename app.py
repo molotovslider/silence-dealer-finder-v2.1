@@ -200,200 +200,47 @@ def is_valid_email(e):
 
 def email_belongs_to_dealer(email, dealer_name, dealer_addr=""):
     """
-    Strict validation: is this email actually from this dealer?
-
-    Returns (bool, confidence 0-1, explanation)
-
-    Rules (in priority order):
-    1. Domain contains dealer name keyword → HIGH confidence
-    2. Local part contains dealer name keyword → HIGH confidence
-    3. It's a generic professional prefix on a business domain → MEDIUM
-    4. Free provider (gmail etc) needs strong name match → STRICT
-    5. Fuzzy similarity score → only if >= 0.65
+    STRICT RULE: the dealer name (or a significant part of it)
+    must appear in the email address (local part or domain).
+    Otherwise → no email.
     """
-    if not is_valid_email(email): return False, 0.0, "email malformé"
+    if not email or "@" not in email: return False, 0, "invalide"
 
-    local  = norm(email.split("@")[0])
-    dom    = norm(email.split("@")[-1].split(".")[0])
-    is_free = any(p in email.split("@")[-1] for p in FREE_MAIL)
+    local    = norm(email.split("@")[0])
+    dom      = norm(email.split("@")[-1].split(".")[0])
+    dom_full = email.split("@")[-1].lower()
+    full     = norm(email)
 
-    # Name keywords (words > 2 chars, normalized)
-    name_kws = [norm(w) for w in re.split(r"[\s\-\'&/,.()]", dealer_name) if len(w) > 2]
-    # City from address
-    city_kws = []
-    if dealer_addr:
-        m = re.search(r"\d{5}\s+(.+)", dealer_addr)
-        if m:
-            city_kws = [norm(w) for w in m.group(1).split() if len(w) > 3]
+    # Blacklisted domains (insurance, finance, etc.)
+    SKIP_DOMS = ["sollyazar.","allianz.","axa.","maif.","macif.","3s2i.",
+                 "google.","bing.","duckduckgo.","societe.com","generali.",
+                 "mma.","groupama.","covea.","april.","bnpparibas.","lcl.",
+                 "credit-agricole.","boursorama.","indeed.","monster."]
+    if any(p in dom_full for p in SKIP_DOMS):
+        return False, 0, "domaine blacklisté"
 
-    # ── Rule 1: domain matches dealer name ───────────────────────────────
-    for kw in name_kws:
-        if len(kw) >= 4:
-            if kw in dom or dom in kw:
-                return True, 0.95, f"domaine '{dom}' correspond à '{kw}'"
+    # Build keywords from dealer name
+    # Include: words >= 3 chars + full concatenated name + acronym
+    kws = [norm(w) for w in re.split(r"[\s\-'&/,.()]", dealer_name) if len(w) >= 3]
+    concat = norm(dealer_name)
+    if concat and concat not in kws: kws.append(concat)
+    # Short uppercase words (acronyms like VSP, ABN, IBO, AWA)
+    for w in re.split(r"[\s\-'&/,.()]", dealer_name):
+        if len(w) >= 2 and w.isupper():
+            kws.append(norm(w))
+    kws = list(dict.fromkeys(kws))  # deduplicate
 
-    # ── Rule 2: local part contains dealer name keyword ───────────────────
-    for kw in name_kws:
-        if len(kw) >= 4 and kw in local:
-            return True, 0.90, f"préfixe contient '{kw}'"
+    # THE ONE RULE: a keyword from the dealer name must appear
+    # in the local part OR in the domain
+    for kw in kws:
+        if len(kw) >= 2:
+            if kw in local:
+                return True, 0.95, f"'{kw}' dans le préfixe"
+            if kw in dom:
+                return True, 0.95, f"'{kw}' dans le domaine"
 
-    # ── Rule 3: dealer name keyword in full email ─────────────────────────
-    full = norm(email)
-    for kw in name_kws:
-        if len(kw) >= 5 and kw in full:
-            return True, 0.85, f"email contient '{kw}'"
+    return False, 0.0, "nom du concessionnaire absent de l'email"
 
-    # ── Rule 4: city in domain ────────────────────────────────────────────
-    for kw in city_kws:
-        if len(kw) >= 4 and kw in dom:
-            return True, 0.70, f"ville '{kw}' dans domaine"
-
-    # ── Rule 5: professional generic on business domain ───────────────────
-    PRO_PREFIXES = ["contact","info","accueil","commercial","vente","direction",
-                    "secretariat","apv","sav","service","garage","auto","moto",
-                    "vsp","reception","marketing","admin","manager","concess"]
-    if not is_free:
-        for pfx in PRO_PREFIXES:
-            if pfx in local:
-                # Only valid if domain looks like a business (has >4 chars before TLD)
-                dom_full = email.split("@")[-1].lower()
-                dom_name_part = dom_full.split(".")[0]
-                if len(dom_name_part) >= 4:
-                    return True, 0.72, f"préfixe pro '{pfx}' sur domaine métier"
-
-    # ── Rule 6: initials match ────────────────────────────────────────────
-    if name_kws:
-        initials = "".join(w[0] for w in name_kws if w)
-        abbrev   = "".join(w[:4] for w in name_kws[:3] if w)
-        if len(initials) >= 3 and initials in local:
-            return True, 0.78, f"initiales '{initials}' dans préfixe"
-        if len(abbrev) >= 5 and abbrev in local:
-            return True, 0.75, f"abréviation '{abbrev}' dans préfixe"
-
-    # ── Rule 7: local part contains significant part of dealer name ─────
-    # e.g. "nautimarine@gmail.com" → local="nautimarine" → matches "NAUTIMARINE"
-    # e.g. "rhonalpauto@orange.fr" → local="rhonalpauto" → matches "RHONALP AUTO"
-    name_joined = "".join(name_kws)
-    if name_joined and len(name_joined) >= 4:
-        # Check if local is basically the dealer name concatenated
-        # e.g. local="rhonalpauto", name_kws=["rhonalp","auto"] → "rhonalp" in "rhonalpauto"
-        for kw in name_kws:
-            if len(kw) >= 3 and kw in local:
-                return True, 0.85, f"nom '{kw}' dans préfixe email"
-
-        # Fuzzy ratio — same threshold for all providers
-        # (free providers already filtered by rule 2 above if name matches)
-        common = sum(1 for c in local if c in name_joined)
-        score  = common / max(len(local), len(name_joined))
-        # For free providers: need 65% (not 72%) — catches "rhonalpauto@gmail"
-        # For business domains: need 50%
-        threshold = 0.65 if is_free else 0.50
-        if score >= threshold:
-            return True, round(score, 2), f"similarité {score:.0%}"
-
-    return False, 0.0, "aucun lien avec le concessionnaire"
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# NETWORK
-# ═════════════════════════════════════════════════════════════════════════════
-
-def fetch(url, timeout=18, retries=3, referer="https://www.google.com"):
-    """Fetch with Selenium (real Chrome) → requests → urllib cascade."""
-
-    # ── Selenium: real Chrome, impossible to block ────────────────────────
-    try:
-        from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options
-        opts = Options()
-        opts.add_argument("--headless=new")
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--disable-blink-features=AutomationControlled")
-        opts.add_argument(f"--user-agent={random.choice(UA_POOL)}")
-        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-        opts.add_experimental_option("useAutomationExtension", False)
-        driver = None
-        try:
-            from webdriver_manager.chrome import ChromeDriverManager
-            from selenium.webdriver.chrome.service import Service
-            driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
-        except Exception:
-            driver = webdriver.Chrome(options=opts)
-        driver.set_page_load_timeout(timeout)
-        driver.get(url)
-        time.sleep(1.5)
-        html = driver.page_source
-        driver.quit()
-        if html and len(html) > 3000:
-            return html
-    except Exception:
-        pass
-
-    # ── requests with session ─────────────────────────────────────────────
-    try:
-        import requests
-        s = requests.Session()
-        s.headers.update({
-            "User-Agent": random.choice(UA_POOL),
-            "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
-            "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.7",
-            "Referer": referer,
-        })
-        try: s.get(re.match(r"https?://[^/]+", url).group(0), timeout=6)
-        except: pass
-        r = s.get(url, timeout=timeout, allow_redirects=True)
-        r.encoding = r.apparent_encoding or "utf-8"
-        if len(r.text) > 2000: return r.text
-    except Exception:
-        pass
-
-    # ── urllib fallback ───────────────────────────────────────────────────
-    last = None
-    for attempt in range(retries):
-        try:
-            cj = http.cookiejar.CookieJar()
-            opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
-            opener.addheaders = [
-                ("User-Agent", random.choice(UA_POOL)),
-                ("Accept", "text/html,*/*;q=0.9"),
-                ("Accept-Language", "fr-FR,fr;q=0.9"),
-                ("Referer", referer),
-            ]
-            with opener.open(url, timeout=timeout) as r:
-                raw = r.read()
-                enc = r.headers.get_content_charset("utf-8") or "utf-8"
-                return raw.decode(enc, errors="replace")
-        except Exception as e:
-            last = e
-            time.sleep(1.5 * (attempt + 1))
-    raise last or Exception(f"Impossible de charger: {url}")
-
-
-def get_emails_raw(text, excl):
-    """Extract all structurally valid emails, excluding known constructors."""
-    out = set()
-    for m in EMAIL_RE.finditer(text):
-        e = m.group(0).lower().strip(".,;:<>\"'()")
-        dom = e.split("@")[-1]
-        if (is_valid_email(e)
-                and not any(x in dom for x in excl)
-                and not any(s in dom for s in SKIP_DOMAINS)):
-            out.add(e)
-    return out
-
-
-def get_phones(text):
-    seen, out = set(), []
-    for m in PHONE_RE.finditer(text):
-        p = re.sub(r"[\s.\-]", "", m.group(0))
-        if p not in seen: seen.add(p); out.append(p)
-    return out
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# SCRAPE DEALER PAGE
-# ═════════════════════════════════════════════════════════════════════════════
 
 def scrape_dealer_page(url, excl, log, prog, timeout=18, retries=3):
     prog(5, "Chargement de la page…")
