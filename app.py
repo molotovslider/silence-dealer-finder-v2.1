@@ -407,38 +407,148 @@ def scrape_domain_emails(domain, excl, log, timeout=12):
 
 # ── Enrichissement complet ────────────────────────────────────────────────────
 def google_search_emails(name, addr, excl, log):
-    """Search DuckDuckGo for emails: fastest method."""
+    """
+    Search emails via multiple sources:
+    1. Google Search
+    2. Google Maps (place search API)
+    3. DuckDuckGo
+    4. Bing
+    5. Pages Jaunes
+    6. Societe.com
+    """
     found = set()
     city = ""
     if addr:
         m = re.search(r"\d{5}\s+(\S+)", addr)
         if m: city = m.group(1)
+    name_clean = re.sub(r"[^a-zA-ZÀ-ÿ0-9\s]", " ", name).strip()
 
-    queries = [
-        f'"{name}" email',
-        f'"{name}" {city} email' if city else None,
-        f'"{name}" contact mail',
-        f'{name} {city} concessionnaire email' if city else f'{name} concessionnaire email',
+    # ── Source 1: Google Search ───────────────────────────────────────────
+    google_queries = [
+        f'"{name_clean}" email',
+        f'"{name_clean}" {city} email' if city else None,
+        f'{name_clean} contact email concessionnaire',
     ]
-
-    for q in [x for x in queries if x]:
+    for q in [x for x in google_queries if x]:
         try:
-            log(f"  🔍 Recherche: {q[:60]}")
-            url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(q)
-            html = fetch(url, timeout=12, ref="https://duckduckgo.com")
+            log(f"  🔍 Google: {q[:55]}")
+            url = "https://www.google.com/search?q=" + urllib.parse.quote(q) + "&hl=fr&num=10"
+            html = fetch(url, timeout=12, ref="https://www.google.com")
             clean = re.sub(r"<[^>]+>", " ", html)
-            clean = re.sub(r"\s+", " ", clean)
             emails = get_emails(clean, excl)
             if emails:
                 found.update(emails)
-                for e in sorted(emails):
-                    log(f"  ✅ Email trouvé: {e}")
+                for e in sorted(emails)[:5]:
+                    log(f"  ✅ Google: {e}")
                 break
-            else:
-                log(f"  ↳ Aucun email dans les résultats")
-            time.sleep(random.uniform(0.3, 0.8))
+            time.sleep(random.uniform(1.0, 2.0))
         except Exception as e:
-            log(f"  ⚠️ Erreur recherche: {str(e)[:50]}")
+            log(f"  ↳ Google indisponible: {str(e)[:40]}")
+            break  # Google blocked, skip remaining queries
+
+    if found: return found
+
+    # ── Source 2: Google Maps Places ──────────────────────────────────────
+    try:
+        log(f"  🗺️  Google Maps: {name_clean[:40]}")
+        search_term = f"{name_clean} {city}".strip()
+        url = ("https://www.google.com/maps/search/"
+               + urllib.parse.quote(search_term)
+               + "?hl=fr")
+        html = fetch(url, timeout=12, ref="https://www.google.com/maps")
+        clean = re.sub(r"<[^>]+>", " ", html)
+        emails = get_emails(clean, excl)
+        if emails:
+            found.update(emails)
+            for e in sorted(emails)[:5]:
+                log(f"  ✅ Google Maps: {e}")
+            return found
+        # Also check for website URL in maps result
+        url_pattern = re.compile(r'https?://[^\s<>"]{8,60}')
+        site_m = url_pattern.search(html)
+        if site_m:
+            domain = re.sub(r"https?://(?:www\.)?", "", site_m.group(0)).split("/")[0]
+            if domain and "." in domain and not any(p in domain for p in PLATFORM_SKIP):
+                log(f"  🗺️  Site trouvé via Maps: {domain}")
+                scraped = scrape_domain_emails(domain, excl, log)
+                found.update(scraped)
+                if found:
+                    for e in sorted(found)[:3]:
+                        log(f"  ✅ Maps→Site: {e}")
+                    return found
+    except Exception as e:
+        log(f"  ↳ Google Maps: {str(e)[:40]}")
+
+    # ── Source 3: DuckDuckGo ──────────────────────────────────────────────
+    ddg_urls = [
+        "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(f'"{name_clean}" email'),
+        "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(f'{name_clean} {city} contact mail') if city else None,
+    ]
+    for url in [u for u in ddg_urls if u]:
+        try:
+            log(f"  🔍 DuckDuckGo: {name_clean[:40]}")
+            html = fetch(url, timeout=12, ref="https://duckduckgo.com")
+            clean = re.sub(r"<[^>]+>", " ", html)
+            emails = get_emails(clean, excl)
+            if emails:
+                found.update(emails)
+                for e in sorted(emails)[:3]:
+                    log(f"  ✅ DDG: {e}")
+                return found
+            time.sleep(random.uniform(0.5, 1.0))
+        except Exception:
+            pass
+
+    # ── Source 4: Bing ────────────────────────────────────────────────────
+    try:
+        log(f"  🔍 Bing: {name_clean[:40]}")
+        q = urllib.parse.quote(f'"{name_clean}" email contact')
+        html = fetch(f"https://www.bing.com/search?q={q}&setlang=fr",
+                     timeout=12, ref="https://www.bing.com")
+        clean = re.sub(r"<[^>]+>", " ", html)
+        emails = get_emails(clean, excl)
+        if emails:
+            found.update(emails)
+            for e in sorted(emails)[:3]:
+                log(f"  ✅ Bing: {e}")
+            return found
+    except Exception:
+        pass
+
+    # ── Source 5: Pages Jaunes ────────────────────────────────────────────
+    try:
+        log(f"  🔍 Pages Jaunes: {name_clean[:35]}")
+        q = urllib.parse.quote(f"{name_clean} {city}".strip())
+        html = fetch(f"https://www.pagesjaunes.fr/pagesblanches/recherche?quoiqui={q}",
+                     timeout=12, ref="https://www.pagesjaunes.fr")
+        clean = re.sub(r"<[^>]+>", " ", html)
+        emails = get_emails(clean, excl)
+        if emails:
+            found.update(emails)
+            for e in sorted(emails)[:3]:
+                log(f"  ✅ PJ: {e}")
+            return found
+    except Exception:
+        pass
+
+    # ── Source 6: Societe.com ─────────────────────────────────────────────
+    try:
+        log(f"  🔍 Societe.com: {name_clean[:35]}")
+        q = urllib.parse.quote(name_clean)
+        html = fetch(f"https://www.societe.com/cgi-bin/search?champs={q}",
+                     timeout=12, ref="https://www.societe.com")
+        clean = re.sub(r"<[^>]+>", " ", html)
+        emails = get_emails(clean, excl)
+        if emails:
+            found.update(emails)
+            for e in sorted(emails)[:3]:
+                log(f"  ✅ Societe.com: {e}")
+            return found
+    except Exception:
+        pass
+
+    if not found:
+        log(f"  ↳ Aucun email trouvé (toutes sources épuisées)")
     return found
 
 
