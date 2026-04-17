@@ -418,11 +418,35 @@ def scrape_dealer_page(url, excl, log, prog, timeout=18, retries=3):
             a = htag.find("a") or htag
             name = a.get_text(strip=True)
             if not name or len(name) < 3 or len(name) > 100: continue
-            SKIP = ("tél","tel","fax","email","adresse","voir","notre","les ","le ",
-                    "la ","pour ","avec ","sans ","tous","département","région",
-                    "accueil","bienvenue","cliquez","réseau","network")
-            if any(name.lower().startswith(s) for s in SKIP): continue
+            SKIP_START = ("tél","tel","fax","email","adresse","voir","notre","les ",
+                          "le ","la ","pour ","avec ","sans ","tous","département",
+                          "région","accueil","bienvenue","cliquez","réseau","network",
+                          "voiture sans permis","scooter","moto électrique")
+            if any(name.lower().startswith(s) for s in SKIP_START): continue
             if re.match(r"^\d", name): continue
+
+            # Filter department/region names: "Ain (01)", "Aisne (02)", "Nord", etc.
+            # Pattern: short word + optional (XX) = French department
+            if re.match(r"^[A-ZÀ-Ÿa-zà-ÿ\s\-]+\s*\(\d{2,3}\)\s*$", name): continue
+            if re.match(r"^[A-ZÀ-Ÿa-zà-ÿ\s\-]+\s*\d{2,3}\s*$", name.strip()) and len(name.split()) <= 3: continue
+            # Single generic word = region/category, not a dealer
+            REGIONS = {"ain","aisne","allier","alpes","ardèche","ardennes","ariège",
+                       "aube","aude","aveyron","bouches","calvados","cantal","charente",
+                       "cher","corrèze","corse","côte","creuse","dordogne","doubs",
+                       "drôme","eure","finistère","gard","gers","gironde","hérault",
+                       "ille","indre","isère","jura","landes","loir","loire","loiret",
+                       "lot","lozère","maine","manche","marne","mayenne","meurthe",
+                       "meuse","morbihan","moselle","nièvre","nord","oise","orne",
+                       "pas","puy","pyrénées","bas-rhin","haut-rhin","rhône","haute-saône",
+                       "saône","sarthe","savoie","paris","seine","deux-sèvres","somme",
+                       "tarn","var","vaucluse","vendée","vienne","vosges","yonne",
+                       "territoire","essonne","hauts","val","france","espagne","spain"}
+            name_lower = name.lower().strip()
+            # Remove department number if present
+            name_no_num = re.sub(r"\s*\(\d+\)\s*$","",name_lower).strip()
+            if name_no_num in REGIONS: continue
+            # Also skip if it looks like "Region (01)" pattern used by Aixam
+            if re.search(r"\(\d{2,3}\)", name): continue
 
             key = norm(name)[:22]
             if not key or key in seen: continue
