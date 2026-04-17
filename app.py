@@ -408,9 +408,9 @@ def scrape_domain_emails(domain, excl, log, timeout=12):
 # ── Enrichissement complet ────────────────────────────────────────────────────
 def google_search_emails(name, addr, excl, log):
     """
-    Search emails — stops immediately when first email found.
-    Scans full page HTML (Google shows emails directly in results).
-    Sources in order: Google → Google Maps → DuckDuckGo → Bing → Pages Jaunes → Societe.com
+    Search emails using real Chrome (Selenium) to bypass all blocks.
+    Scans full page — Google shows emails directly in snippets.
+    Stops immediately when first email found.
     """
     city = ""
     if addr:
@@ -418,14 +418,13 @@ def google_search_emails(name, addr, excl, log):
         if m: city = m.group(1)
     n = re.sub(r"[^a-zA-ZÀ-ÿ0-9\s]", " ", name).strip()
 
-    def scan_full_page(html, source):
-        """Scan the entire page — Google puts emails anywhere in the HTML."""
-        # Full raw text scan
-        full_text = re.sub(r"<[^>]+>", " ", html)
-        full_text = re.sub(r"\s+", " ", full_text)
-        emails = get_emails(full_text, excl)
-        # Also scan raw HTML for mailto: links
-        for m2 in re.finditer(r"mailto:([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})", html):
+    def scan_full(html, source):
+        """Scan entire HTML — emails appear anywhere in Google results."""
+        text = re.sub(r"<[^>]+>", " ", html)
+        text = re.sub(r"\s+", " ", text)
+        emails = get_emails(text, excl)
+        # Also grab mailto: links from raw HTML
+        for m2 in re.finditer(r"mailto:([\w._%+\-]+@[\w.\-]+\.[a-zA-Z]{2,})", html):
             e = m2.group(1).lower()
             if is_real(e) and not any(x in e.split("@")[-1] for x in excl):
                 emails.add(e)
@@ -434,60 +433,85 @@ def google_search_emails(name, addr, excl, log):
                 log(f"  ✅ [{source}] {e}")
         return emails
 
-    # ── 1. Google Search ──────────────────────────────────────────────────
-    for q in [f'"{n}" email', f'"{n}" {city} email' if city else None,
-              f'{n} concessionnaire email contact']:
-        if not q: continue
+    def selenium_search(query, log_prefix="Google"):
+        """Use real Chrome via Selenium — impossible to block."""
         try:
-            log(f"  🔍 Google: {q[:55]}")
-            url = "https://www.google.com/search?q=" + urllib.parse.quote(q) + "&hl=fr&num=10"
-            html = fetch(url, timeout=12, ref="https://www.google.com")
-            emails = scan_full_page(html, "Google")
-            if emails:
-                log(f"  ✔ Trouvé via Google — recherche arrêtée")
-                return emails
-            time.sleep(random.uniform(1.0, 1.8))
+            from selenium import webdriver
+            from selenium.webdriver.chrome.options import Options
+            from selenium.webdriver.common.by import By
+            from selenium.webdriver.support.ui import WebDriverWait
+            from selenium.webdriver.support import expected_conditions as EC
+
+            opts = Options()
+            opts.add_argument("--headless=new")
+            opts.add_argument("--no-sandbox")
+            opts.add_argument("--disable-dev-shm-usage")
+            opts.add_argument("--disable-blink-features=AutomationControlled")
+            opts.add_argument(f"--user-agent={random.choice(UA_POOL)}")
+            opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+            opts.add_experimental_option("useAutomationExtension", False)
+
+            # Try webdriver-manager first, then system chrome
+            driver = None
+            try:
+                from webdriver_manager.chrome import ChromeDriverManager
+                from selenium.webdriver.chrome.service import Service
+                service = Service(ChromeDriverManager().install())
+                driver = webdriver.Chrome(service=service, options=opts)
+            except Exception:
+                driver = webdriver.Chrome(options=opts)
+
+            driver.set_page_load_timeout(15)
+            url = "https://www.google.com/search?q=" + urllib.parse.quote(query) + "&hl=fr&num=10"
+            driver.get(url)
+            time.sleep(1.5)  # let page fully render
+            html = driver.page_source
+            driver.quit()
+            return html
         except Exception as e:
-            log(f"  ↳ Google bloqué ({str(e)[:30]}) — source suivante")
-            break
+            log(f"  ↳ Selenium indisponible: {str(e)[:40]}")
+            return None
 
-    # ── 2. Google Maps ────────────────────────────────────────────────────
+    # ── 1. Google via Selenium (vrai Chrome) ─────────────────────────────
+    queries = [
+        f'"{n}" email',
+        f'"{n}" {city} email' if city else None,
+        f'{n} concessionnaire contact email',
+    ]
+    for q in [x for x in queries if x]:
+        log(f"  🔍 Google (Chrome): {q[:55]}")
+        html = selenium_search(q, "Google")
+        if html:
+            emails = scan_full(html, "Google")
+            if emails:
+                log(f"  ✔ Email trouvé via Google — arrêt de la recherche")
+                return emails
+        time.sleep(random.uniform(0.8, 1.5))
+
+    # ── 2. Google Maps via Selenium ───────────────────────────────────────
     try:
-        log(f"  🗺️  Google Maps: {n[:40]}")
-        url = "https://www.google.com/maps/search/" + urllib.parse.quote(f"{n} {city}".strip()) + "?hl=fr"
-        html = fetch(url, timeout=12, ref="https://www.google.com/maps")
-        emails = scan_full_page(html, "Google Maps")
-        if emails:
-            log(f"  ✔ Trouvé via Google Maps — recherche arrêtée")
-            return emails
-        # Extract website from Maps result and scrape it
-        url_pattern = re.compile(r'https?://[^\s<>"]{8,60}')
-        for m2 in url_pattern.finditer(html):
-            href = m2.group(0)
-            dom = re.sub(r"https?://(?:www\.)?", "", href).split("/")[0].lower()
-            if dom and "." in dom and not any(p in dom for p in PLATFORM_SKIP) and dom not in excl:
-                log(f"  🗺️  Site Maps→scraping: {dom}")
-                scraped = scrape_domain_emails(dom, excl, log)
-                if scraped:
-                    for e in sorted(scraped)[:3]: log(f"  ✅ [Maps→Site] {e}")
-                    log(f"  ✔ Trouvé via Maps+Site — recherche arrêtée")
-                    return scraped
-                break
-    except Exception as e:
-        log(f"  ↳ Google Maps: {str(e)[:35]}")
+        log(f"  🗺️  Google Maps (Chrome): {n[:40]}")
+        html = selenium_search(f"{n} {city} concessionnaire".strip(), "Maps")
+        if html:
+            emails = scan_full(html, "Google Maps")
+            if emails:
+                log(f"  ✔ Email trouvé via Google Maps — arrêt")
+                return emails
+    except Exception:
+        pass
 
-    # ── 3. DuckDuckGo ─────────────────────────────────────────────────────
+    # ── 3. DuckDuckGo (urllib fallback) ───────────────────────────────────
     for q in [f'"{n}" email', f'{n} {city} contact' if city else None]:
         if not q: continue
         try:
             log(f"  🔍 DuckDuckGo: {q[:50]}")
             url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(q)
             html = fetch(url, timeout=12, ref="https://duckduckgo.com")
-            emails = scan_full_page(html, "DuckDuckGo")
+            emails = scan_full(html, "DuckDuckGo")
             if emails:
-                log(f"  ✔ Trouvé via DuckDuckGo — recherche arrêtée")
+                log(f"  ✔ Email trouvé via DuckDuckGo — arrêt")
                 return emails
-            time.sleep(random.uniform(0.6, 1.2))
+            time.sleep(random.uniform(0.5, 1.0))
         except Exception:
             break
 
@@ -497,9 +521,9 @@ def google_search_emails(name, addr, excl, log):
         q = urllib.parse.quote(f'"{n}" email contact')
         html = fetch(f"https://www.bing.com/search?q={q}&setlang=fr",
                      timeout=12, ref="https://www.bing.com")
-        emails = scan_full_page(html, "Bing")
+        emails = scan_full(html, "Bing")
         if emails:
-            log(f"  ✔ Trouvé via Bing — recherche arrêtée")
+            log(f"  ✔ Email trouvé via Bing — arrêt")
             return emails
     except Exception:
         pass
@@ -510,9 +534,9 @@ def google_search_emails(name, addr, excl, log):
         q = urllib.parse.quote(f"{n} {city}".strip())
         html = fetch(f"https://www.pagesjaunes.fr/pagesblanches/recherche?quoiqui={q}",
                      timeout=12, ref="https://www.pagesjaunes.fr")
-        emails = scan_full_page(html, "Pages Jaunes")
+        emails = scan_full(html, "Pages Jaunes")
         if emails:
-            log(f"  ✔ Trouvé via Pages Jaunes — recherche arrêtée")
+            log(f"  ✔ Email trouvé via Pages Jaunes — arrêt")
             return emails
     except Exception:
         pass
@@ -523,14 +547,14 @@ def google_search_emails(name, addr, excl, log):
         q = urllib.parse.quote(n)
         html = fetch(f"https://www.societe.com/cgi-bin/search?champs={q}",
                      timeout=12, ref="https://www.societe.com")
-        emails = scan_full_page(html, "Societe.com")
+        emails = scan_full(html, "Societe.com")
         if emails:
-            log(f"  ✔ Trouvé via Societe.com — recherche arrêtée")
+            log(f"  ✔ Email trouvé via Societe.com — arrêt")
             return emails
     except Exception:
         pass
 
-    log(f"  ✗ Aucun email trouvé (6 sources épuisées)")
+    log(f"  ✗ Aucun email trouvé — 6 sources épuisées")
     return set()
 
 
