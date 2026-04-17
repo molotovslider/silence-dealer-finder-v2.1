@@ -886,7 +886,7 @@ class App(tk.Tk):
         cv.create_oval(13,13,23,23, fill=C["white"], outline="")
 
         tk.Label(left, text="SILENCE", bg=C["dark"], fg=C["white"],
-                 font=("Helvetica",17,"bold"), letterSpacing=3).pack(side="left")
+                 font=("Helvetica",17,"bold")).pack(side="left")
         tk.Label(left, text="  ECO · DEALER FINDER", bg=C["dark"], fg=C["red"],
                  font=("Helvetica",9)).pack(side="left")
 
