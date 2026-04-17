@@ -198,6 +198,96 @@ def is_valid_email(e):
     if "." not in dom: return False
     return True
 
+def get_phones(text):
+    seen, out = set(), []
+    for m in PHONE_RE.finditer(text):
+        p = re.sub(r"[\s.\-]", "", m.group(0))
+        if p not in seen: seen.add(p); out.append(p)
+    return out
+
+def get_emails_raw(text, excl):
+    out = set()
+    for m in EMAIL_RE.finditer(text):
+        e = m.group(0).lower().strip(".,;:<>\"'()")
+        dom = e.split("@")[-1]
+        if (is_valid_email(e)
+                and not any(x in dom for x in excl)
+                and not any(s in dom for s in SKIP_DOMAINS)):
+            out.add(e)
+    return out
+
+def fetch(url, timeout=18, retries=3, referer="https://www.google.com"):
+    """Fetch with Selenium → requests → urllib cascade."""
+    # ── Selenium ──────────────────────────────────────────────────────────
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+        opts = Options()
+        opts.add_argument("--headless=new")
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--disable-blink-features=AutomationControlled")
+        opts.add_argument(f"--user-agent={random.choice(UA_POOL)}")
+        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+        opts.add_experimental_option("useAutomationExtension", False)
+        driver = None
+        try:
+            from webdriver_manager.chrome import ChromeDriverManager
+            from selenium.webdriver.chrome.service import Service
+            driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
+        except Exception:
+            driver = webdriver.Chrome(options=opts)
+        driver.set_page_load_timeout(timeout)
+        driver.get(url)
+        time.sleep(1.5)
+        html = driver.page_source
+        driver.quit()
+        if html and len(html) > 3000:
+            return html
+    except Exception:
+        pass
+    # ── requests ──────────────────────────────────────────────────────────
+    try:
+        import requests
+        s = requests.Session()
+        s.headers.update({
+            "User-Agent": random.choice(UA_POOL),
+            "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
+            "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.7",
+            "Referer": referer,
+        })
+        try:
+            base = re.match(r"https?://[^/]+", url)
+            if base: s.get(base.group(0), timeout=6)
+        except Exception:
+            pass
+        r = s.get(url, timeout=timeout, allow_redirects=True)
+        r.encoding = r.apparent_encoding or "utf-8"
+        if len(r.text) > 2000: return r.text
+    except Exception:
+        pass
+    # ── urllib ────────────────────────────────────────────────────────────
+    last = None
+    for attempt in range(retries):
+        try:
+            cj = http.cookiejar.CookieJar()
+            opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+            opener.addheaders = [
+                ("User-Agent", random.choice(UA_POOL)),
+                ("Accept", "text/html,*/*;q=0.9"),
+                ("Accept-Language", "fr-FR,fr;q=0.9"),
+                ("Referer", referer),
+            ]
+            with opener.open(url, timeout=timeout) as r:
+                raw = r.read()
+                enc = r.headers.get_content_charset("utf-8") or "utf-8"
+                return raw.decode(enc, errors="replace")
+        except Exception as e:
+            last = e
+            time.sleep(1.5 * (attempt + 1))
+    raise last or Exception(f"Impossible de charger: {url}")
+
+
 def email_belongs_to_dealer(email, dealer_name, dealer_addr=""):
     """
     STRICT RULE: the dealer name (or a significant part of it)
