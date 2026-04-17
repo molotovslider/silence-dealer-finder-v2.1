@@ -323,97 +323,125 @@ def enrich_dealer(dealer, excl, log, delay=1.2, timeout=15):
     return {e: r for e, r in all_em.items() if is_real(e)}, src
 
 # ── Scraper de page réseau ────────────────────────────────────────────────────
+def fetch_full(url, timeout=18, retries=4):
+    """Fetch with headers that trigger full server-side rendering."""
+    last = None
+    for attempt in range(retries):
+        try:
+            headers = {
+                "User-Agent": random.choice(UA_POOL),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Referer": "https://www.google.com/",
+                "DNT": "1",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "cross-site",
+                "Cache-Control": "max-age=0",
+            }
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                raw = r.read()
+                enc = r.headers.get_content_charset("utf-8") or "utf-8"
+                return raw.decode(enc, errors="replace")
+        except Exception as e:
+            last = e
+            if attempt < retries - 1:
+                time.sleep(2 * (attempt + 1) + random.uniform(0, 2))
+    raise last or Exception(f"Échec: {url}")
+
 def scrape_page(url, excl, log, prog, timeout=18, retries=3):
     prog(5, "Chargement de la page…")
     log(f"GET {url}")
     html = fetch(url, timeout=timeout, retries=retries)
     log(f"Page reçue — {len(html)//1024} Ko")
-
-    # ── Essai 1 : JSON embarqué (API interne) ─────────────────────────────
-    prog(15, "Recherche données JSON…")
-    json_dealers = []
-    for pattern in [
-        r'"name"\s*:\s*"([^"]{3,80})"[^}]*?"(phone|tel)[^"]*"\s*:\s*"([^"]{6,20})"',
-        r'"title"\s*:\s*"([^"]{3,80})"[^}]*?"phone"\s*:\s*"([^"]{6,20})"',
-    ]:
-        for m in re.finditer(pattern, html, re.I | re.S):
-            name = m.group(1).strip()
-            if name and len(name) > 3:
-                json_dealers.append({"name": name, "from": "json"})
-    if json_dealers:
-        log(f"JSON embarqué: {len(json_dealers)} entrées détectées")
-
-    prog(20, "Analyse HTML…")
+    prog(18, "Analyse HTML…")
     dealers = []
+    PHONE_RE2 = re.compile(r"(?:\+33|\+34|\+44|0)[\s.\-]?[1-9](?:[\s.\-]?\d{2}){4}")
+    ADDR_RE2  = re.compile(r"\d{1,4}[\s,]+[^\d\n]{5,60}[\s,]+\d{5}[\s,]+[A-ZÀ-Ÿa-zà-ÿ\s\-]{2,35}", re.I)
 
     try:
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, "html.parser")
-        for t in soup(["script", "style", "nav", "footer", "head", "header", "aside"]):
-            t.decompose()
+        for t in soup(["script","style","nav","footer","head","header","aside"]): t.decompose()
+        clean_text = soup.get_text(" ", strip=True)
 
-        base_url = re.match(r"https?://[^/]+", url)
-        base_url = base_url.group(0) if base_url else ""
-        parsed_path = urllib.parse.urlparse(url).path
-        path_prefix = re.sub(r"/[^/]*$", "/", parsed_path)
+        base_url = (re.match(r"https?://[^/]+", url) or type("x",[],{"group":lambda s,i:""})()).group(0)
+        parsed   = urllib.parse.urlparse(url)
+        path_dir = re.sub(r"/[^/]*$", "/", parsed.path)
 
         seen = set()
 
-        # ── Stratégie A : h3/h2 = noms de concessionnaires ────────────────
-        headings = soup.find_all(["h2", "h3"])
-        log(f"Headings h2/h3 trouvés: {len(headings)}")
-
-        for heading in headings:
-            name = heading.get_text(strip=True)
+        # ── Méthode 1 : h3 comme noms (Aixam, la plupart des sites réseaux) ──
+        for h3 in soup.find_all(["h3","h4"]):
+            a_tag = h3.find("a")
+            name  = (a_tag or h3).get_text(strip=True)
             if not name or len(name) < 3 or len(name) > 100: continue
-            if re.match(r"^(tél|tel|fax|email|mail|adresse|voir|cliquez|départe|région|accueil|bienvenue|notre|nos |les |le |la |pour |avec |sans |\d)", name, re.I): continue
+            skip_words = ("tél","tel","fax","email","adresse","voir","cliquer",
+                          "notre","les ","le ","la ","pour ","avec ","sans ",
+                          "tous","département","région","accueil","bienvenue")
+            if any(name.lower().startswith(w) for w in skip_words): continue
+            if re.match(r"^\d", name): continue
 
             key = re.sub(r"[^a-z0-9]", "", name.lower())[:22]
             if not key or key in seen: continue
             seen.add(key)
 
-            # Collecter le contenu suivant jusqu'au prochain heading
-            siblings = []
-            node = heading.next_sibling
-            for _ in range(40):
+            # Contenu après le h3 jusqu'au prochain h3/h4
+            block_parts = []
+            node = h3.next_sibling
+            for _ in range(50):
                 if node is None: break
-                if hasattr(node, "name") and node.name in ["h2", "h3"]: break
-                siblings.append(str(node))
+                if hasattr(node,"name") and node.name in ["h3","h4","h2","h1"]: break
+                block_parts.append(str(node))
                 node = node.next_sibling
-            block_html = "".join(siblings)
-            block_soup = BeautifulSoup(block_html, "html.parser")
-            txt = block_soup.get_text(" ", strip=True)
-            parent_txt = heading.parent.get_text(" ", strip=True) if heading.parent else ""
+            block_html = "".join(block_parts)
+            b = BeautifulSoup(block_html, "html.parser")
+            btxt = b.get_text(" ", strip=True)
+
+            # Aussi regarder le parent direct du h3
+            parent_txt = h3.parent.get_text(" ", strip=True) if h3.parent else ""
 
             # Adresse
             addr = ""
-            am = ADDR_RE.search(txt) or ADDR_RE.search(parent_txt)
-            if am: addr = am.group(0).strip()[:100]
+            for src_txt in [btxt, parent_txt]:
+                am = ADDR_RE2.search(src_txt)
+                if am: addr = am.group(0).strip()[:120]; break
             if not addr:
-                for tag in block_soup.find_all(["p", "address", "span", "div"]):
+                # Chercher un code postal 5 chiffres dans le bloc
+                for tag in b.find_all(["p","address","div","span"]):
                     t2 = tag.get_text(" ", strip=True)
-                    if re.search(r"\d{5}", t2) and len(t2) < 150:
-                        addr = t2[:100]; break
+                    if re.search(r"\d{5}", t2) and 5 < len(t2) < 200:
+                        addr = t2[:120]; break
 
-            phones = get_phones(txt + " " + parent_txt)
-            phone = phones[0] if phones else ""
+            # Téléphone
+            phones = get_phones(btxt + " " + parent_txt)
+            phone  = phones[0] if phones else ""
 
-            # Emails visibles
-            pg = get_emails(txt + " " + parent_txt, excl)
-            for a in block_soup.find_all("a", href=True):
+            # Emails visibles dans le bloc
+            pg = get_emails(btxt + " " + parent_txt, excl)
+            for a in b.find_all("a", href=True):
                 h2 = a["href"]
                 if h2.startswith("mailto:"):
                     e = h2[7:].split("?")[0].strip().lower()
                     if is_real(e) and not any(x in e.split("@")[-1] for x in excl):
                         pg.add(e)
 
-            # Lien fiche concessionnaire
+            # Lien fiche du concessionnaire
             profile = ""
-            for a in (heading.parent.find_all("a", href=True) if heading.parent else []):
-                h2 = a["href"]
-                if h2.startswith("/"): h2 = base_url + h2
-                if base_url in h2 and path_prefix in h2 and h2.rstrip("/") != url.rstrip("/"):
-                    profile = h2; break
+            if a_tag and a_tag.get("href"):
+                href = a_tag["href"]
+                if href.startswith("/"): href = base_url + href
+                profile = href
+            if not profile and h3.parent:
+                for a in h3.parent.find_all("a", href=True):
+                    href = a["href"]
+                    if href.startswith("/"): href = base_url + href
+                    if base_url in href and path_dir in href and href.rstrip("/") != url.rstrip("/"):
+                        profile = href; break
 
             dealers.append({
                 "name": name[:80], "addr": addr, "phone": phone,
@@ -422,44 +450,41 @@ def scrape_page(url, excl, log, prog, timeout=18, retries=3):
                 "src": "page" if pg else "pending",
             })
 
-        log(f"Stratégie h3: {len(dealers)} concessionnaires")
+        log(f"Méthode h3/h4: {len(dealers)} concessionnaires")
 
-        # ── Stratégie B : sélecteurs CSS ──────────────────────────────────
-        if len(dealers) < 3:
+        # ── Méthode 2 : sélecteurs CSS (autres sites) ──────────────────────
+        if len(dealers) < 5:
             log("Tentative sélecteurs CSS…")
-            best_blocks, best_count = [], 0
+            best_blocks, best_n = [], 0
             for sel in [
-                "[class*='dealer']", "[class*='concess']", "[class*='revendeur']",
-                "[class*='reseau']", "[class*='network']", "[class*='store']",
-                "[class*='location']", "[class*='point']", "[class*='retailer']",
-                "[class*='item']", "[class*='card']", "[class*='entry']",
-                "article", "li",
+                "[class*='dealer']","[class*='concess']","[class*='revendeur']",
+                "[class*='reseau']","[class*='network']","[class*='store']",
+                "[class*='location']","[class*='retailer']","[class*='point-de-vente']",
+                "[class*='distributor']","[class*='agent']",
+                "article","[class*='card']","[class*='item']",
             ]:
                 found = soup.select(sel)
-                valid = [b for b in found if (
-                    PHONE_RE.search(b.get_text()) or
-                    EMAIL_RE.search(b.get_text()) or
-                    len(b.get_text(strip=True)) > 40
-                )]
-                if len(valid) > best_count:
-                    best_count = len(valid)
-                    best_blocks = valid
+                valid = [b for b in found
+                         if PHONE_RE2.search(b.get_text())
+                         or EMAIL_RE.search(b.get_text())
+                         or (len(b.get_text(strip=True)) > 40 and len(b.get_text(strip=True)) < 800)]
+                if len(valid) > best_n:
+                    best_n = len(valid); best_blocks = valid
+            log(f"Meilleur CSS: {best_n} blocs")
 
-            log(f"Meilleur sélecteur CSS: {best_count} blocs")
             for blk in best_blocks:
                 txt = blk.get_text(" ", strip=True)
                 if len(txt) < 15: continue
                 name = ""
-                for tag in blk.find_all(["h1","h2","h3","h4","h5","strong","b"]):
+                for tag in blk.find_all(["h2","h3","h4","h5","strong","b"]):
                     v = tag.get_text(strip=True)
-                    if 3 < len(v) < 90 and not PHONE_RE.match(v) and not v.replace(" ","").isdigit():
+                    if 3 < len(v) < 90 and not PHONE_RE2.match(v) and not v.replace(" ","").isdigit():
                         name = v; break
                 if not name: continue
                 key = re.sub(r"[^a-z0-9]", "", name.lower())[:22]
                 if not key or key in seen: continue
                 seen.add(key)
-                am = ADDR_RE.search(txt)
-                addr = am.group(0).strip()[:100] if am else ""
+                am = ADDR_RE2.search(txt); addr = am.group(0).strip()[:120] if am else ""
                 phones = get_phones(txt); phone = phones[0] if phones else ""
                 pg = get_emails(txt, excl)
                 for a in blk.find_all("a", href=True):
@@ -474,22 +499,23 @@ def scrape_page(url, excl, log, prog, timeout=18, retries=3):
                     "src": "page" if pg else "pending",
                 })
 
-        # ── Stratégie C : fallback blocs avec téléphone ───────────────────
-        if len(dealers) < 3:
-            log("Fallback téléphones…")
-            for blk in soup.find_all(["div","li","article","p"]):
-                if not PHONE_RE.search(blk.get_text()): continue
+        # ── Méthode 3 : fallback blocs avec téléphone ──────────────────────
+        if len(dealers) < 5:
+            log("Fallback blocs téléphone…")
+            for blk in soup.find_all(["div","li","article","p","section"]):
+                if not PHONE_RE2.search(blk.get_text()): continue
                 txt = blk.get_text(" ", strip=True)
+                if len(txt) < 20 or len(txt) > 1000: continue
                 name = ""
-                for tag in blk.find_all(["strong","b","span"]):
+                for tag in blk.find_all(["strong","b","span","h5","h4","h3"]):
                     v = tag.get_text(strip=True)
-                    if 3 < len(v) < 90 and not PHONE_RE.match(v): name = v; break
+                    if 3 < len(v) < 90 and not PHONE_RE2.match(v): name = v; break
                 if not name: continue
                 key = re.sub(r"[^a-z0-9]", "", name.lower())[:22]
                 if not key or key in seen: continue
                 seen.add(key)
                 phones = get_phones(txt); phone = phones[0] if phones else ""
-                am = ADDR_RE.search(txt); addr = am.group(0)[:100] if am else ""
+                am = ADDR_RE2.search(txt); addr = am.group(0)[:120] if am else ""
                 pg = get_emails(txt, excl)
                 dealers.append({
                     "name": name[:80], "addr": addr, "phone": phone,
@@ -499,20 +525,22 @@ def scrape_page(url, excl, log, prog, timeout=18, retries=3):
                 })
 
     except ImportError:
-        # ── Sans BeautifulSoup : regex ────────────────────────────────────
-        log("Mode regex (bs4 non installé)")
-        clean = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html))
+        # ── Sans BeautifulSoup : regex sur le HTML brut ────────────────────
+        log("Mode regex (bs4 non installé)…")
+        # Extraire noms depuis les h3 avec liens
         names = re.findall(r"<h3[^>]*>\s*(?:<a[^>]*>)?([^<]{3,80})(?:</a>)?\s*</h3>", html, re.I)
+        clean = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html))
         seen = set()
         for name in names:
             name = name.strip()
+            if not name or len(name) < 3: continue
             key = re.sub(r"[^a-z0-9]", "", name.lower())[:22]
-            if not key or key in seen: continue
+            if key in seen: continue
             seen.add(key)
             idx = clean.find(name[:20])
-            ctx = clean[max(0, idx-50):idx+400] if idx >= 0 else ""
+            ctx = clean[max(0,idx-30):idx+350] if idx >= 0 else ""
             phones = get_phones(ctx); phone = phones[0] if phones else ""
-            am = ADDR_RE.search(ctx); addr = am.group(0)[:100] if am else ""
+            am = ADDR_RE2.search(ctx); addr = am.group(0)[:120] if am else ""
             em_l = list(get_emails(ctx, excl))
             dealers.append({
                 "name": name[:80], "addr": addr, "phone": phone,
@@ -520,13 +548,32 @@ def scrape_page(url, excl, log, prog, timeout=18, retries=3):
                 "emails": {e: guess_role(e) for e in em_l},
                 "src": "page" if em_l else "pending",
             })
+        # Fallback téléphones si pas de h3
+        if not dealers:
+            seen2 = set()
+            for m in PHONE_RE.finditer(clean):
+                ph = re.sub(r"[\s.\-]","",m.group(0))
+                idx = m.start()
+                ctx = clean[max(0,idx-200):idx+200]
+                nm  = re.search(r"([A-ZÀ-Ÿ][a-zà-ÿ]+(?:\s+[A-ZÀ-Ÿa-zà-ÿ\-]+){1,4})", ctx)
+                name = nm.group(1) if nm else f"Concessionnaire {len(dealers)+1}"
+                key = re.sub(r"[^a-z0-9]","",name.lower())[:20]
+                if key in seen2: continue
+                seen2.add(key)
+                em_l = list(get_emails(ctx, excl))
+                dealers.append({
+                    "name": name[:80], "addr": "", "phone": ph,
+                    "website": "", "profile_url": "",
+                    "emails": {e: guess_role(e) for e in em_l},
+                    "src": "page" if em_l else "pending",
+                })
 
-    # Dédup final
-    final, seen2 = [], set()
+    # ── Déduplication finale ───────────────────────────────────────────────
+    final, seen3 = [], set()
     for d in dealers:
         k = re.sub(r"[^a-z0-9]", "", d["name"].lower())[:20]
-        if k and k not in seen2:
-            seen2.add(k); final.append(d)
+        if k and k not in seen3:
+            seen3.add(k); final.append(d)
 
     log(f"✓ {len(final)} concessionnaires uniques extraits")
     return final
