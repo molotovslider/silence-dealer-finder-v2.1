@@ -10,27 +10,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install all dependencies
-        run: |
-          pip install pyinstaller beautifulsoup4 requests selenium webdriver-manager
-      - name: Build EXE
+      - name: Install
+        run: pip install pyinstaller beautifulsoup4 requests selenium webdriver-manager
+      - name: Build
         run: |
           pyinstaller --onefile --windowed --name SilenceDealerFinder `
-            --hidden-import=selenium `
-            --hidden-import=selenium.webdriver `
+            --hidden-import=bs4 --hidden-import=requests `
+            --hidden-import=selenium --hidden-import=selenium.webdriver `
             --hidden-import=selenium.webdriver.chrome `
             --hidden-import=selenium.webdriver.chrome.options `
             --hidden-import=selenium.webdriver.chrome.service `
-            --hidden-import=selenium.webdriver.common.by `
-            --hidden-import=selenium.webdriver.support.ui `
-            --hidden-import=selenium.webdriver.support.expected_conditions `
-            --hidden-import=webdriver_manager `
-            --hidden-import=webdriver_manager.chrome `
-            --hidden-import=bs4 `
-            --hidden-import=requests `
+            --hidden-import=webdriver_manager --hidden-import=webdriver_manager.chrome `
             --hidden-import=http.cookiejar `
-            --collect-all selenium `
-            --collect-all webdriver_manager `
+            --collect-all selenium --collect-all webdriver_manager `
             app.py
       - uses: actions/upload-artifact@v4
         with:
@@ -44,27 +36,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install all dependencies
-        run: |
-          pip install pyinstaller beautifulsoup4 requests selenium webdriver-manager
-      - name: Build MAC
+      - name: Install
+        run: pip install pyinstaller beautifulsoup4 requests selenium webdriver-manager
+      - name: Build
         run: |
           pyinstaller --onefile --windowed --name SilenceDealerFinder \
-            --hidden-import=selenium \
-            --hidden-import=selenium.webdriver \
+            --hidden-import=bs4 --hidden-import=requests \
+            --hidden-import=selenium --hidden-import=selenium.webdriver \
             --hidden-import=selenium.webdriver.chrome \
             --hidden-import=selenium.webdriver.chrome.options \
             --hidden-import=selenium.webdriver.chrome.service \
-            --hidden-import=selenium.webdriver.common.by \
-            --hidden-import=selenium.webdriver.support.ui \
-            --hidden-import=selenium.webdriver.support.expected_conditions \
-            --hidden-import=webdriver_manager \
-            --hidden-import=webdriver_manager.chrome \
-            --hidden-import=bs4 \
-            --hidden-import=requests \
+            --hidden-import=webdriver_manager --hidden-import=webdriver_manager.chrome \
             --hidden-import=http.cookiejar \
-            --collect-all selenium \
-            --collect-all webdriver_manager \
+            --collect-all selenium --collect-all webdriver_manager \
             app.py
       - uses: actions/upload-artifact@v4
         with:
