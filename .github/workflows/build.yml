@@ -11,17 +11,14 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install dependencies
-        run: |
-          pip install pyinstaller beautifulsoup4 requests playwright
-          python -m playwright install chromium
-          python -m playwright install-deps chromium
+        run: pip install pyinstaller beautifulsoup4 requests selenium webdriver-manager
       - name: Build EXE
         run: |
           pyinstaller --onefile --windowed --name SilenceDealerFinder `
-            --hidden-import=playwright `
             --hidden-import=bs4 `
             --hidden-import=requests `
-            --collect-all playwright `
+            --hidden-import=selenium `
+            --hidden-import=http.cookiejar `
             app.py
       - uses: actions/upload-artifact@v4
         with:
@@ -36,16 +33,14 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install dependencies
-        run: |
-          pip install pyinstaller beautifulsoup4 requests playwright
-          python -m playwright install chromium
+        run: pip install pyinstaller beautifulsoup4 requests selenium webdriver-manager
       - name: Build MAC
         run: |
           pyinstaller --onefile --windowed --name SilenceDealerFinder \
-            --hidden-import=playwright \
             --hidden-import=bs4 \
             --hidden-import=requests \
-            --collect-all playwright \
+            --hidden-import=selenium \
+            --hidden-import=http.cookiejar \
             app.py
       - uses: actions/upload-artifact@v4
         with:
