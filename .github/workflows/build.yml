@@ -7,25 +7,34 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - run: pip install pyinstaller beautifulsoup4
+
       - run: pyinstaller --onefile --windowed --name SilenceDealerFinder app.py
+
       - uses: actions/upload-artifact@v4
         with:
           name: SilenceDealerFinder-Windows
           path: dist/SilenceDealerFinder.exe
 
+
   mac:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - run: pip install pyinstaller beautifulsoup4
+
       - run: pyinstaller --onefile --windowed --name SilenceDealerFinder app.py
+
       - uses: actions/upload-artifact@v4
         with:
           name: SilenceDealerFinder-Mac
