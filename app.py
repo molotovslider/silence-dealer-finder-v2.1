@@ -752,9 +752,10 @@ def scrape_website(domain, excl, log):
 
 def enrich_dealer(dealer, excl, log, delay=0.8, timeout=15):
     """
-    Full enrichment pipeline for one dealer.
-    Priority: web search → website scrape → Hunter.io
-    All emails strictly validated against dealer name.
+    Enrichment pipeline — smart and fast:
+    - If emails already found on page → use them directly, skip web search
+    - If no emails on page → search web (Google, DDG, Bing, etc.)
+    - Always try Hunter.io if we have a domain
     """
     all_em = dict(dealer.get("emails", {}))
     src    = dealer.get("src", "pending")
@@ -762,41 +763,44 @@ def enrich_dealer(dealer, excl, log, delay=0.8, timeout=15):
 
     log(f"┌ {name}")
 
-    # ── Step 1: Web search (Google, Maps, DDG, Bing, PJ, Societe) ─────────
-    log(f"│ 1/3 Recherche web…")
-    found = search_emails_for_dealer(dealer, excl, log)
-    if found:
-        all_em.update(found)
-        src = "web"
+    # ── Already has emails from page → skip web search ────────────────────
+    if all_em:
+        log(f"│ ✓ Email(s) déjà trouvé(s) sur la page — pas de recherche web")
+    else:
+        # ── Step 1: Web search (Google, Maps, DDG, Bing, PJ) ─────────────
+        log(f"│ 1/3 Recherche web…")
+        found = search_emails_for_dealer(dealer, excl, log)
+        if found:
+            all_em.update(found)
+            src = "web"
 
-    # ── Step 2: Dealer website ────────────────────────────────────────────
-    log(f"│ 2/3 Recherche du site web…")
+    # ── Step 2: Find dealer website ───────────────────────────────────────
+    log(f"│ 2/3 Site web…")
     domain = find_dealer_website(name, dealer["addr"], log)
     if domain:
         dealer["website"] = domain
-        log(f"│  → Site: {domain}")
-        scraped = scrape_website(domain, excl, log)
-        for e in scraped:
-            if e not in all_em:
+        log(f"│  → {domain}")
+        # Scrape only if we still have no emails
+        if not all_em:
+            scraped = scrape_website(domain, excl, log)
+            for e in scraped:
                 ok, sc, rs = email_belongs_to_dealer(e, name, dealer["addr"])
                 if ok:
                     all_em[e] = guess_role(e)
                     log(f"│  ✅ [Site] {e}")
-        if scraped and src == "pending": src = "web"
+                    src = "web"
 
-        # ── Step 3: Hunter.io ────────────────────────────────────────────
-        log(f"│ 3/3 Hunter.io…")
+        # ── Step 3: Hunter.io (always, for enrichment) ───────────────────
+        log(f"│ 3/3 Hunter.io ({domain})…")
         h = hunter_search(domain, excl, log)
-        # Hunter emails are domain-validated (same domain = same business)
-        all_em.update(h)
-        if h: src = "hunter"
+        if h:
+            all_em.update(h)
+            src = "hunter"
     else:
         log(f"│  → Site non trouvé — Hunter ignoré")
 
     total = len(all_em)
-    icon  = "✓" if total > 0 else "✗"
-    log(f"└ {icon} {total} email(s) — {src}")
-
+    log(f"└ {'✓' if total else '✗'} {total} email(s) — {src}")
     return {e: r for e, r in all_em.items() if is_valid_email(e)}, src
 
 
@@ -1157,8 +1161,15 @@ class App(tk.Tk):
             self._set_prog(44, "Enrichissement emails…")
 
             if self._v1.get():
-                pending = [d for d in dealers if not d["emails"]]
-                self._log_add(f"━━━ {len(pending)} concessionnaires à enrichir ━━━")
+                # All dealers go through enrichment:
+                # - Those WITH emails: skip web search, only do Hunter
+                # - Those WITHOUT emails: full web search pipeline
+                pending = dealers  # process all for Hunter at minimum
+                no_email = sum(1 for d in dealers if not d["emails"])
+                has_email = len(dealers) - no_email
+                self._log_add(f"━━━ {len(dealers)} concessionnaires ━━━")
+                self._log_add(f"  {has_email} avec email(s) → enrichissement Hunter seulement")
+                self._log_add(f"  {no_email} sans email → recherche web complète")
                 lock = threading.Lock()
                 done = [0]
 
