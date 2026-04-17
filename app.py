@@ -239,7 +239,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.lang="FR";self.results=[];self.excl=list(EXCL_DEFAULT)
-        self.hunter_key="";self.claude_key="";self._running=False
+        self.hunter_key="6f720d52e7ff130ef0717a890cd35abcac84c6fd";self.claude_key="";self._running=False
         self.configure(bg=DARK);self.geometry("1050x700");self.minsize(820,580)
         self._build();self._apply_lang()
     def L(self,k): return T[self.lang].get(k,k)
@@ -400,7 +400,7 @@ class App(tk.Tk):
             messagebox.showinfo("Claude AI ✓","Clé API Claude valide !")
         except Exception as e: self._claude_st.configure(text="✗",fg=RED);messagebox.showerror("Claude AI",str(e))
     def _save(self):
-        self.hunter_key=self._hunter_var.get().strip();self.claude_key=self._claude_var.get().strip()
+        # keys are built-in
         raw=self._excl_txt.get("1.0","end").strip()
         self.excl=[l.strip().lstrip("@") for l in raw.splitlines() if l.strip()]
         self._upd_ind();messagebox.showinfo("OK",self.L("saved"))
