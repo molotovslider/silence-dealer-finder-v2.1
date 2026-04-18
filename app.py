@@ -28,8 +28,6 @@ def detect_system():
     else:
         return {"mode":"eco",    "threads":3,  "delay":1.0, "cpu":cpu, "ram":ram}
 
-SYSTEM = detect_system()
-
 def _ensure_deps():
     needed = []
     try: import selenium
@@ -62,6 +60,9 @@ def _ensure_deps():
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
 _ensure_deps()
+
+# System detection AFTER deps are installed (psutil may have just been installed)
+SYSTEM = detect_system()
 
 # ── Clés API intégrées ────────────────────────────────────────────────────────
 HUNTER_KEY = "6f720d52e7ff130ef0717a890cd35abcac84c6fd"
@@ -428,95 +429,10 @@ def normalize(s):
     return re.sub(r"[^a-z0-9]", "", s)
 
 def email_matches_dealer(email, dealer_name, dealer_addr="", threshold=0.35):
-    """
-    Validate that an email is actually related to this dealer.
-    Checks:
-    1. Email domain or local part contains keywords from dealer name
-    2. OR email is a generic business contact (contact@, info@, etc.)
-    3. OR dealer name words appear in the email
-    Returns (bool, confidence_score, reason)
-    """
-    if not email or "@" not in email:
-        return False, 0, "email invalide"
+    """Wrapper — delegates to score_email. Returns (bool, score, reason)."""
+    s, r = score_email(email, dealer_name, source="search")
+    return s >= 20, s / 100.0, r  # keep all, only 0% (blacklisted) rejected
 
-    local = normalize(email.split("@")[0])
-    domain = normalize(email.split("@")[-1].split(".")[0])  # e.g. "nautimarine" from nautimarine.com
-    full_email_norm = normalize(email)
-
-    # Normalize dealer name — split into meaningful words (>2 chars)
-    name_words = [normalize(w) for w in re.split(r"[\s\-\'&/,.]", dealer_name) if len(w) > 2]
-    city_words = []
-    if dealer_addr:
-        city_words = [normalize(w) for w in re.split(r"[\s\-,]", dealer_addr) if len(w) > 2]
-
-    # ── Check 1: Domain matches dealer name words ──────────────────────────
-    for word in name_words:
-        if len(word) >= 4 and (word in domain or domain in word):
-            return True, 0.95, f"domaine '{domain}' ≈ nom '{word}'"
-
-    # ── Check 2: Local part matches dealer name words ──────────────────────
-    for word in name_words:
-        if len(word) >= 4 and word in local:
-            return True, 0.90, f"local '{local}' contient '{word}'"
-
-    # ── Check 3: Dealer name words appear in full email ────────────────────
-    for word in name_words:
-        if len(word) >= 5 and word in full_email_norm:
-            return True, 0.85, f"email contient '{word}'"
-
-    # ── Check 4: Generic professional email — ONLY if domain relates to dealer ──
-    # e.g. contact@snv-vivant.fr is valid for SNV VIVANT MOBILITE
-    # but info@unknownshop.fr is NOT valid for NAUTIMARINE
-    GENERIC_OK = ["contact", "info", "accueil", "commercial", "vente", "secretariat",
-                  "direction", "apv", "sav", "service", "garage", "auto", "moto",
-                  "vsp", "voiture", "permis", "concess", "dealer", "reception",
-                  "marketing", "compta", "admin", "manager", "mail", "bonjour"]
-    FREE_PROV = ["gmail","orange","hotmail","yahoo","outlook","sfr","wanadoo",
-                 "free","laposte","numericable","bbox","live","icloud","msn"]
-    email_on_free = any(p in email.split("@")[-1] for p in FREE_PROV)
-    for g in GENERIC_OK:
-        if g in local:
-            # For free providers (gmail etc), generic prefix alone is not enough
-            if email_on_free:
-                break  # need name match
-            # For business domains, check domain relates to dealer
-            domain_ok = any(len(w) >= 4 and (w in domain or domain in w)
-                           for w in name_words if len(w) >= 3)
-            if domain_ok:
-                return True, 0.75, f"générique pro '{g}' + domaine métier"
-            # If domain has city name that matches address
-            city_ok = any(len(w) >= 4 and w in domain for w in city_words)
-            if city_ok:
-                return True, 0.65, f"générique pro '{g}' + ville dans domaine"
-
-    # ── Check 5: City name in domain or local ─────────────────────────────
-    for word in city_words:
-        if len(word) >= 4 and (word in domain or word in local):
-            return True, 0.65, f"ville '{word}' dans l'email"
-
-    # ── Check 6: Gmail/Orange/etc with dealer initials ────────────────────
-    # e.g. "snvvivant@gmail.com" for "SNV VIVANT MOBILITE"
-    if name_words:
-        initials = "".join(w[0] for w in name_words if w)
-        abbrev   = "".join(w[:3] for w in name_words[:2] if w)
-        if (len(initials) >= 2 and initials in local) or (len(abbrev) >= 4 and abbrev in local):
-            return True, 0.75, f"initiales/abréviation dans l'email"
-
-    # ── Check 7: Fuzzy match — stricter for free email providers ────────
-    FREE_PROVIDERS = ["gmail","orange","hotmail","yahoo","outlook","sfr",
-                      "wanadoo","free","laposte","numericable","bbox","live","icloud","msn"]
-    is_free = any(p in email.split("@")[-1] for p in FREE_PROVIDERS)
-
-    name_joined = "".join(name_words)
-    if name_joined and len(name_joined) > 4:
-        common = sum(1 for c in local if c in name_joined)
-        score = common / max(len(local), len(name_joined))
-        # Free providers need 70% similarity (not 35%) — avoids false positives
-        min_score = 0.70 if is_free else threshold
-        if score >= min_score:
-            return True, score, f"similarité {score:.0%}"
-
-    return False, 0, "email non lié au concessionnaire"
 
 def get_emails(text, excl, filter_generic=False):
     out = set()
@@ -1987,7 +1903,7 @@ class App(tk.Tk):
             to = self.timeout_v.get()
             rt = self.retries_v.get()
             dly = self.delay.get()
-            log(f"⚡ Mode {self._perf_mode.get().upper()} · {self._max_threads} threads parallèles · délai {dly}s")
+            self._log_add(f"⚡ Mode {self._perf_mode.get().upper()} · {self._max_threads} threads parallèles · délai {dly}s", "ok")
 
             dealers = self._SP(url, excl, self._log_add,
                                self._set_prog, timeout=to, retries=rt)
@@ -2381,127 +2297,103 @@ if __name__ == "__main__":
     )
     app.mainloop()
 # Domaines toujours exclus (assurances, plateformes, etc.)
+# Always excluded (insurance, platforms)
 BAD_DOMAINS = [
     "sollyazar.","allianz.","axa.","maif.","macif.","generali.",
-    "mma.","groupama.","covea.","april.","bnpparibas.","lcl.",
-    "google.","bing.","facebook.","instagram.","twitter.",
-    "linkedin.","youtube.","indeed.","monster.",
-    "pagesjaunes.","societe.com","verif.com","pappers.",
-    "w3.org","schema.org","cloudflare.","sentry.",
+    "mma.","groupama.","covea.","april.","google.","bing.",
+    "facebook.","instagram.","twitter.","linkedin.","youtube.",
+    "indeed.","monster.","pagesjaunes.","societe.com","verif.com",
+    "pappers.","cloudflare.","sentry.","clubmobilite.",
 ]
 
-def score_email(email, dealer_name, source="search", brand_domain=""):
-    """brand_domain: e.g. 'ligier' — emails @ligier.* are excluded as manufacturer emails"""
-    """
-    Score de probabilité 0-100 qu'un email appartient au concessionnaire.
-    Aucun email n'est jamais bloqué (sauf domaines blacklistés).
+GENERIC_TLDS = {"gmail","orange","hotmail","yahoo","outlook","sfr","wanadoo",
+                "free","laposte","bbox","live","icloud","msn",
+                "numericable","bouygues","neuf","alice","club"}
 
-    Barème :
-    ★★★ 90-100% — Certitude : source officielle OU nom exact du concessionnaire dans l'email
-    ★★☆  70-89% — Très probable : partie du nom dans l'email
-    ★☆☆  40-69% — Possible : nom de personne physique, domaine pro lié
-    ☆☆☆  10-39% — Faible : cabinet comptable, prestataire externe possible
+BRAND_WORDS  = {"ligier","aixam","microcar","chatenet","bellier","casalini",
+                "store","partner","service","group","rent"}
+
+SKIP_WORDS   = {"le","la","les","de","du","des","et","au","aux","un","une",
+                "par","sur","pour","avec","sans","dans"}
+
+
+def score_email(email, dealer_name, source="search", brand_domain=""):
     """
-    if not email or "@" not in email or len(email) < 6:
-        return 0, "invalide"
+    Score générique unique : un mot du nom du concessionnaire
+    apparaît-il dans l'email (préfixe ou domaine) ?
+
+    Règle unique — pas de cas particuliers :
+    ⭐⭐⭐ 90-98% : source officielle OU mot exact dans l'email
+    ⭐⭐  70-89% : mot contenu dans l'email (avec ou sans fournisseur gratuit)
+    ⭐   35-40% : domaine business sans correspondance
+    ·   20%    : fournisseur gratuit sans correspondance
+    ✗   0%     : blacklisté
+    """
+    if not email or "@" not in email: return 0, "invalide"
 
     dom_full = email.split("@")[-1].lower()
+
     if any(p in dom_full for p in BAD_DOMAINS):
         return 0, "domaine blacklisté"
-    # Exclude manufacturer/brand emails (e.g. @ligier.fr when scraping Ligier network)
+
     if brand_domain and brand_domain.lower() in dom_full:
-        return 0, f"email du constructeur ({brand_domain}) — exclu"
+        return 0, f"email du constructeur ({brand_domain})"
 
-    # ── Sources fiables → score élevé garanti ────────────────────────────
-    if source == "page":    return 98, "page officielle constructeur ★★★"
-    if source == "site":    return 95, "site web du concessionnaire ★★★"
-    if source == "hunter":  return 90, "Hunter.io — même domaine ★★★"
+    if source == "page":    return 98, "page officielle ⭐⭐⭐"
+    if source == "site":    return 95, "site web ⭐⭐⭐"
+    if source == "hunter":  return 90, "Hunter.io ⭐⭐⭐"
 
-    # ── Calcul pour source=search ─────────────────────────────────────────
-    local = normalize(email.split("@")[-1].split(".")[0] + email.split("@")[0])
-    local_only = normalize(email.split("@")[0])
-    dom   = normalize(email.split("@")[-1].split(".")[0])
-    FREE  = {"gmail","orange","hotmail","yahoo","outlook","sfr","wanadoo",
-             "free","laposte","bbox","live","icloud","msn","numericable"}
-    is_free = email.split("@")[-1].split(".")[0].lower() in FREE
+    local    = normalize(email.split("@")[0])
+    dom      = normalize(email.split("@")[-1].split(".")[0])
+    is_free  = dom in GENERIC_TLDS
 
-    # Mots-clés du nom du concessionnaire (sans préfixe marque ni ville)
-    clean = re.sub(r"^(Ligier\s+(Store|Partner|Service|Group)\s*)",
-                   "", dealer_name, flags=re.I).strip()
-    # Garder TOUS les mots significatifs (>= 2 chars)
-    all_words = []
-    for w in re.split(r"[\s\-\'&/,.()]", clean):
-        nw = normalize(w)
-        if len(nw) >= 2:
-            all_words.append(nw)
-    # Ajouter aussi le nom complet normalisé
-    full = normalize(clean)
-    if full not in all_words:
-        all_words.append(full)
-    all_words = list(dict.fromkeys(all_words))
+    # Mots du nom — tout mot ≥ 3 chars sauf articles et mots de marque
+    words = [normalize(w) for w in re.split(r"[\s\-\'&/,.]", dealer_name)
+             if len(normalize(w)) >= 3
+             and normalize(w) not in SKIP_WORDS
+             and normalize(w) not in BRAND_WORDS]
+    if not words:
+        words = [normalize(dealer_name)]
+    words = list(dict.fromkeys(words))
 
-    # ── RÈGLE 1 : Nom complet du concessionnaire dans l'email → 95% ───────
-    if full and len(full) >= 4 and (full in local_only or full in dom):
-        return 95, f"nom complet '{full}' dans l'email ★★★"
+    best_score = 0
+    best_reason = ""
 
-    # ── RÈGLE 2 : Mot-clé du nom dans préfixe ou domaine → 85% ──────────
-    for word in all_words:
+    for word in words:
         if len(word) < 3: continue
-        if word in local_only:
-            return 85, f"'{word}' dans le préfixe ★★☆"
-        if word in dom:
-            return 82, f"'{word}' dans le domaine ★★☆"
+        # Correspondance exacte
+        if word == local:      s, r = 92, f"préfixe = '{word}'"
+        elif word == dom:      s, r = 92, f"domaine = '{word}'"
+        # Contenu dans
+        elif word in local:    s, r = 85, f"'{word}' dans préfixe"
+        elif word in dom:      s, r = 82, f"'{word}' dans domaine"
+        # Inclusion inverse
+        elif len(local)>=4 and local in word: s, r = 78, f"préfixe '{local}' ⊂ '{word}'"
+        elif len(dom)>=4   and dom   in word: s, r = 75, f"domaine '{dom}' ⊂ '{word}'"
+        else: continue
+        if s > best_score: best_score, best_reason = s, r
 
-    # ── RÈGLE 3 : Préfixe inclus dans domaine ou inverse → 75% ──────────
-    if len(dom) >= 4 and dom in local_only:
-        return 75, f"domaine '{dom}' dans préfixe ★★☆"
-    if len(local_only) >= 4 and local_only in dom:
-        return 72, f"préfixe dans domaine '{dom}' ★★☆"
+    if best_score == 0:
+        if is_free: return 20, "aucun lien — adresse gratuite ·"
+        else:       return 35, "domaine business sans lien identifié ⭐"
 
-    # ── RÈGLE 4 : Préfixe pro générique (contact@, info@…) ───────────────
-    # Valide seulement si le domaine a un lien avec le secteur ou le nom
-    PRO_PREFIXES = {"contact","info","accueil","vente","commercial","sav",
-                    "direction","secretariat","reception","admin","service",
-                    "garage","auto","moto","vsp","mairie"}
-    if local_only in PRO_PREFIXES:
-        if is_free:
-            return 35, f"préfixe pro '{local_only}' — fournisseur gratuit ☆☆☆"
-        # Pour domaine business: vérifier qu'il y a un lien avec le nom ou le secteur
-        dom_has_link = any(w in dom or dom in w for w in all_words if len(w)>=3)
-        if dom_has_link:
-            return 60, f"préfixe pro '{local_only}' + domaine lié ★☆☆"
-        else:
-            # Domaine business sans lien → on garde mais score faible
-            return 25, f"préfixe pro '{local_only}' — domaine sans lien ☆☆☆"
+    # Légère pénalité fournisseur gratuit (on ne peut pas vérifier l'ownership)
+    if is_free and best_score < 90:
+        best_score = max(best_score - 10, 20)
+        best_reason += " (adresse gratuite)"
 
-    # ── RÈGLE 5 : Ressemble à un nom de personne physique ─────────────────
-    # ex: jean.dupont@gmail.com, m.dupont@orange.fr
-    # Pattern: prenom.nom ou initiale.nom
-    is_person = bool(re.match(r"^[a-z]{1,3}[._-][a-z]{3,}$", local_only)) or \
-                bool(re.match(r"^[a-z]{3,}[._-][a-z]{3,}$", local_only))
-    if is_person:
-        # Vérifier si le nom de famille est dans les mots-clés du concessionnaire
-        parts = re.split(r"[._-]", local_only)
-        for part in parts:
-            if len(part) >= 4 and any(part in w or w in part for w in all_words):
-                return 55, f"nom de personne lié au concessionnaire ★☆☆"
-        # Sinon c'est probablement le patron / un employé
-        return 30, "nom de personne (employé possible) ☆☆☆"
+    # Icône selon score final
+    if best_score >= 90: best_reason += " ⭐⭐⭐"
+    elif best_score >= 70: best_reason += " ⭐⭐"
+    elif best_score >= 40: best_reason += " ⭐"
+    else: best_reason += " ·"
 
-    # ── RÈGLE 6 : Domaine business sans lien apparent ─────────────────────
-    # ex: office@3s2i.fr → société de service informatique
-    if not is_free:
-        # Vérifier si le domaine ressemble à un prestataire externe
-        # (cabinets, agences, etc.) → score faible
-        return 20, "domaine sans lien identifié ☆☆☆"
-
-    # ── RÈGLE 7 : Email générique sur fournisseur gratuit ─────────────────
-    return 15, "aucun lien identifié ☆☆☆"
+    return best_score, best_reason
 
 
-def email_belongs_to_dealer(email, dealer_name, source="search"):
-    """Compatibilité — retourne (bool, reason). Tous les emails >= 10% passent."""
-    score, reason = score_email(email, dealer_name, source)
-    return score >= 10, reason  # On garde tout sauf blacklisté (0%)
+def email_belongs_to_dealer(email, dealer_name, source="search", brand_domain=""):
+    """Compatibilité — retourne (bool, reason). Garde tout sauf blacklisté."""
+    s, r = score_email(email, dealer_name, source, brand_domain)
+    return s > 0, r
 
 
