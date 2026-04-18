@@ -667,7 +667,7 @@ def google_search_emails(name, addr, excl, log):
         pass
 
     # ── 3. DuckDuckGo (urllib fallback) ───────────────────────────────────
-    for q in [f'"{n}" email', f'{n} {city} contact' if city else None]:
+    for q in [f'"{n}" email', f'{n} email', f'{n} {city} contact' if city else None]:
         if not q: continue
         try:
             log(f"  🔍 DuckDuckGo: {q[:50]}")
@@ -1470,9 +1470,12 @@ class App(tk.Tk):
         hsb.pack(side="bottom", fill="x")
         self._tree.pack(fill="both", expand=True)
 
-        self._tree.tag_configure("miss",   background="#FFF5F5")
-        self._tree.tag_configure("web",    background="#FFFBEB")
-        self._tree.tag_configure("hunter", background="#F0FDF4")
+        self._tree.tag_configure("miss",    background="#FFF5F5")
+        self._tree.tag_configure("web",     background="#FFFBEB")
+        self._tree.tag_configure("hunter",  background="#F0FDF4")
+        self._tree.tag_configure("high",    background="#F0FDF4")   # ≥70%
+        self._tree.tag_configure("medium",  background="#FFFBEB")   # 40-69%
+        self._tree.tag_configure("low",     background="#FFF8F0")   # <40%
 
     # ── Tab 3: Settings ────────────────────────────────────────────────────
     def _build_t3(self):
@@ -1858,7 +1861,15 @@ class App(tk.Tk):
                         sorted(x["emails"].items())):
                     tag = {"page":"","web":"web",
                            "hunter":"hunter"}.get(x["src"], "")
-                    self._tree.insert("", "end", tags=(tag,), values=(
+                    # Pick tag based on score in role string
+                    import re as _re
+                    score_m = _re.search(r"\[(\d+)%\]", role)
+                    score_v = int(score_m.group(1)) if score_m else 50
+                    if x["src"] == "hunter": row_tag = "hunter"
+                    elif score_v >= 70: row_tag = "high"
+                    elif score_v >= 40: row_tag = "medium"
+                    else: row_tag = "low"
+                    self._tree.insert("", "end", tags=(row_tag,), values=(
                         n  if i==0 else "",
                         x["name"]  if i==0 else "",
                         x["addr"]  if i==0 else "",
@@ -1948,7 +1959,7 @@ BAD_DOMAINS = [
     "google.","bing.","facebook.","instagram.","twitter.",
     "linkedin.","youtube.","indeed.","monster.",
     "pagesjaunes.","societe.com","verif.com","pappers.",
-    "w3.org","schema.org","cloudflare.","clubmobilite.",
+    "w3.org","schema.org","cloudflare.","sentry.",
 ]
 FREE_PROVIDERS = {
     "gmail","orange","hotmail","yahoo","outlook","sfr",
@@ -1960,69 +1971,102 @@ STOPWORDS = {
     "sarl","sas","eurl"
 }
 
-def email_belongs_to_dealer(email, dealer_name, source="search"):
+def score_email(email, dealer_name, source="search"):
     """
-    Generic validation based on email SOURCE.
+    Returns (score 0-100, reason) for an email.
+    Never blocks — always returns a score.
+    
+    100 = certainement lié au concessionnaire
+    80+ = très probablement lié
+    60+ = probablement lié
+    40+ = peut-être lié
+    <40 = peu probable
 
-    source="page"   → on official constructor page → always valid
-    source="site"   → on dealer's own website → always valid
-    source="hunter" → Hunter.io same domain → always valid
-    source="search" → found via web search → validate by name proximity
+    source="page"|"site"|"hunter" → score élevé garanti
+    source="search" → score calculé par correspondance nom
     """
     if not email or "@" not in email or len(email) < 6:
-        return False, "email invalide"
+        return 0, "email invalide"
 
     dom_full = email.split("@")[-1].lower()
-
-    # Always reject blacklisted domains
-    if any(p in dom_full for p in BAD_DOMAINS):
-        return False, "domaine blacklisté"
-
-    # Trusted sources — no further check needed
-    if source in ("page", "site", "hunter"):
-        return True, f"source fiable ({source})"
-
-    # === Search result: validate by name match ===
     local    = normalize(email.split("@")[0])
     dom      = normalize(email.split("@")[-1].split(".")[0])
     is_free  = email.split("@")[-1].split(".")[0].lower() in FREE_PROVIDERS
 
-    # Build keywords: all words ≥ 2 chars, minus generic stopwords
+    # Blacklisted = 0 regardless
+    if any(p in dom_full for p in BAD_DOMAINS):
+        return 0, "domaine blacklisté"
+
+    # Trusted sources → high scores
+    if source == "page":    return 98, "page officielle constructeur"
+    if source == "site":    return 95, "site web du concessionnaire"
+    if source == "hunter":  return 92, "Hunter.io (même domaine)"
+
+    # === Search result scoring ===
+    # Build keywords
+    clean = re.sub(r"^(Ligier\s+(Store|Partner|Service)\s*)",
+                   "", dealer_name, flags=re.I).strip()
     name_words = []
-    for w in re.split(r"[\s\-\'&/,.(\[\]!?)]", dealer_name):
+    for w in re.split(r"[\s\-\'&/,.(\[\]!?)]", clean):
         nw = normalize(w)
         if len(nw) >= 2 and nw not in STOPWORDS:
             name_words.append(nw)
-    # Add full normalized name and name without brand prefix
-    clean = re.sub(r"^(Ligier\s+(Store|Partner|Service)\s*)",
-                   "", dealer_name, flags=re.I).strip()
-    for extra in [normalize(dealer_name), normalize(clean)]:
+    for extra in [normalize(clean), normalize(dealer_name)]:
         if extra and extra not in name_words:
             name_words.append(extra)
     name_words = list(dict.fromkeys(name_words))
 
-    # Rule 1: any name keyword in local or domain
+    best_score = 0
+    best_reason = ""
+
+    # Check each keyword
     for word in name_words:
-        if len(word) >= 2 and word in local:
-            return True, f"'{word}' dans préfixe"
-        if len(word) >= 2 and word in dom:
-            return True, f"'{word}' dans domaine"
+        if len(word) < 2: continue
+        if word == local:
+            s, r = 90, f"préfixe = nom '{word}'"
+        elif word in local:
+            s, r = 85, f"'{word}' dans préfixe"
+        elif word == dom:
+            s, r = 90, f"domaine = nom '{word}'"
+        elif word in dom:
+            s, r = 82, f"'{word}' dans domaine"
+        else:
+            continue
+        if s > best_score:
+            best_score = s; best_reason = r
 
-    # Rule 2: inclusion — domain in local or local in domain
-    if len(dom) >= 4 and dom in local:
-        return True, "domaine inclus dans préfixe"
-    if len(local) >= 4 and local in dom:
-        return True, "préfixe inclus dans domaine"
+    # Domain/local inclusion
+    if len(dom) >= 4 and dom in local and best_score < 80:
+        best_score = 78; best_reason = "domaine inclus dans préfixe"
+    if len(local) >= 4 and local in dom and best_score < 80:
+        best_score = 75; best_reason = "préfixe inclus dans domaine"
 
-    # Rule 3: character overlap (business domains only, not free providers)
-    if not is_free:
-        name_joined = "".join(name_words[:6])
-        if len(name_joined) >= 4 and len(local) >= 4:
-            overlap = sum(1 for c in local if c in name_joined)
-            ratio   = overlap / max(len(local), len(name_joined))
-            if ratio >= 0.55:
-                return True, f"similarité {ratio:.0%}"
+    # Character overlap
+    name_joined = "".join(name_words[:6])
+    if len(name_joined) >= 4 and len(local) >= 4:
+        overlap = sum(1 for c in local if c in name_joined)
+        ratio   = overlap / max(len(local), len(name_joined))
+        sim_score = int(ratio * 70)  # max 70 for similarity
+        if sim_score > best_score:
+            best_score = sim_score
+            best_reason = f"similarité {ratio:.0%}"
 
-    return False, "aucun lien avec le concessionnaire"
+    # Free provider penalty (if score is only from similarity)
+    if is_free and best_score < 75 and best_score > 0:
+        best_score = max(best_score - 15, 10)
+        best_reason += " (fournisseur gratuit)"
+
+    # Default minimum if email was found near dealer name in search
+    if best_score == 0:
+        best_score = 25
+        best_reason = "trouvé dans résultats de recherche"
+
+    return best_score, best_reason
+
+
+def email_belongs_to_dealer(email, dealer_name, source="search"):
+    """Legacy compatibility — returns (bool, reason). Uses score >= 40."""
+    score, reason = score_email(email, dealer_name, source)
+    return score >= 40, reason
 
 
