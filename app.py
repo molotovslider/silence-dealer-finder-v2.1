@@ -228,7 +228,55 @@ def fetch(url, timeout=18, retries=3, ref="https://www.google.com"):
         ]
         chrome_ok = any(os.path.exists(p) for p in chrome_paths)
 
-        # Auto-download chromedriver if needed
+        def _selenium_fetch(driver_instance):
+            """
+            Full page extraction:
+            1. Load page and wait for JS
+            2. Scroll progressively to trigger lazy loading
+            3. Select ALL text (Ctrl+A) to force full render
+            4. Return complete page source
+            """
+            driver_instance.get(url)
+            time.sleep(2)  # initial JS execution
+
+            # Progressive scroll to trigger lazy loading
+            last_height = 0
+            for _ in range(20):  # scroll up to 20 times
+                # Get current page height
+                height = driver_instance.execute_script(
+                    "return document.body.scrollHeight")
+                if height == last_height:
+                    break  # page fully loaded
+
+                # Scroll down in steps to trigger lazy loading
+                step = height // 5
+                for pos in range(0, height, step):
+                    driver_instance.execute_script(
+                        f"window.scrollTo(0, {pos});")
+                    time.sleep(0.1)
+
+                # Scroll back to top
+                driver_instance.execute_script("window.scrollTo(0, 0);")
+                time.sleep(0.3)
+
+                # Select ALL text on the page (forces full render)
+                try:
+                    driver_instance.execute_script(
+                        "document.execCommand('selectAll', false, null);")
+                except Exception:
+                    pass
+
+                last_height = height
+                time.sleep(0.5)
+
+            # Final scroll to bottom to ensure everything loaded
+            driver_instance.execute_script(
+                "window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(1)
+
+            return driver_instance.page_source
+
+        # Try with webdriver-manager first
         try:
             from webdriver_manager.chrome import ChromeDriverManager
             from selenium.webdriver.chrome.service import Service as ChromeService
@@ -238,20 +286,20 @@ def fetch(url, timeout=18, retries=3, ref="https://www.google.com"):
             opts.add_argument("--disable-dev-shm-usage")
             opts.add_argument("--disable-blink-features=AutomationControlled")
             opts.add_argument(f"--user-agent={random.choice(UA_POOL)}")
+            opts.add_argument("--window-size=1920,1080")
             opts.add_experimental_option("excludeSwitches", ["enable-automation"])
             opts.add_experimental_option("useAutomationExtension", False)
             service = ChromeService(ChromeDriverManager().install())
             driver = webdriver.Chrome(service=service, options=opts)
             driver.set_page_load_timeout(timeout)
-            driver.get(url)
-            time.sleep(2)
-            html = driver.page_source
+            html = _selenium_fetch(driver)
             driver.quit()
             if html and len(html) > 5000:
                 return html
         except Exception:
             pass
 
+        # Fallback: system Chrome
         if chrome_ok:
             opts = Options()
             opts.add_argument("--headless=new")
@@ -259,13 +307,12 @@ def fetch(url, timeout=18, retries=3, ref="https://www.google.com"):
             opts.add_argument("--disable-dev-shm-usage")
             opts.add_argument("--disable-blink-features=AutomationControlled")
             opts.add_argument(f"--user-agent={random.choice(UA_POOL)}")
+            opts.add_argument("--window-size=1920,1080")
             opts.add_experimental_option("excludeSwitches", ["enable-automation"])
             opts.add_experimental_option("useAutomationExtension", False)
             driver = webdriver.Chrome(options=opts)
             driver.set_page_load_timeout(timeout)
-            driver.get(url)
-            time.sleep(2)  # let JS execute
-            html = driver.page_source
+            html = _selenium_fetch(driver)
             driver.quit()
             if html and len(html) > 5000:
                 return html
