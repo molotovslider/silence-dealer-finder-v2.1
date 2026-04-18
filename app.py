@@ -87,7 +87,7 @@ T = {
     col_email="Email", col_src="Source", col_role="Rôle / Personne",
     src_page="Page", src_web="Site web", src_hunter="Hunter.io",
     stat1="Concessionnaires", stat2="Emails trouvés", stat3="Via Hunter/web", stat4="Adresses",
-    btn_copy="Copier les emails", btn_csv="Exporter CSV",
+    btn_copy="Copier les emails", btn_csv="Exporter Excel",
     no_results="Aucun résultat — lancez une extraction",
     # Paramètres
     p_search="Recherche & Extraction",
@@ -124,7 +124,7 @@ T = {
     col_email="Email", col_src="Fuente", col_role="Rol / Persona",
     src_page="Página", src_web="Sitio web", src_hunter="Hunter.io",
     stat1="Concesionarios", stat2="Emails encontrados", stat3="Vía Hunter/web", stat4="Direcciones",
-    btn_copy="Copiar emails", btn_csv="Exportar CSV",
+    btn_copy="Copiar emails", btn_csv="Exportar Excel",
     no_results="Sin resultados — lance una extracción",
     p_search="Búsqueda y Extracción",
     p_delay="Retraso entre solicitudes (segundos)",
@@ -159,7 +159,7 @@ T = {
     col_email="Email", col_src="Source", col_role="Role / Person",
     src_page="Page", src_web="Website", src_hunter="Hunter.io",
     stat1="Dealers", stat2="Emails found", stat3="Via Hunter/web", stat4="Addresses",
-    btn_copy="Copy emails", btn_csv="Export CSV",
+    btn_copy="Copy emails", btn_csv="Export Excel",
     no_results="No results — run an extraction first",
     p_search="Search & Extraction",
     p_delay="Delay between requests (seconds)",
@@ -1246,7 +1246,8 @@ class App(tk.Tk):
         self.open_csv  = tk.BooleanVar(value=False)
         self._anim_id    = None
         self._tick       = 0
-        self._max_threads= SYSTEM["threads"]  # set by perf mode
+        self._max_threads= SYSTEM["threads"]
+        self._perf_mode  = tk.StringVar(value=SYSTEM["mode"])
 
         self.configure(bg=W)
         self.title("Silence.eco — Dealer Finder")
