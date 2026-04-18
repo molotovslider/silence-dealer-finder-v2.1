@@ -8,6 +8,28 @@ from tkinter import ttk, messagebox, scrolledtext
 from datetime import datetime
 
 # ── Auto-install missing modules at first launch ──────────────────────────────
+def detect_system():
+    """Detect CPU/RAM and return recommended performance mode."""
+    try:
+        import psutil
+        cpu  = os.cpu_count() or 2
+        ram  = psutil.virtual_memory().total / (1024**3)
+        avail= psutil.virtual_memory().available / (1024**3)
+    except Exception:
+        cpu = os.cpu_count() or 2
+        ram = 4.0; avail = 2.0
+
+    if cpu >= 8 and ram >= 12:
+        return {"mode":"turbo",  "threads":16, "delay":0.2, "cpu":cpu, "ram":ram}
+    elif cpu >= 6 and ram >= 8:
+        return {"mode":"rapide", "threads":10, "delay":0.3, "cpu":cpu, "ram":ram}
+    elif cpu >= 4 and ram >= 4:
+        return {"mode":"normal", "threads":6,  "delay":0.6, "cpu":cpu, "ram":ram}
+    else:
+        return {"mode":"eco",    "threads":3,  "delay":1.0, "cpu":cpu, "ram":ram}
+
+SYSTEM = detect_system()
+
 def _ensure_deps():
     needed = []
     try: import selenium
@@ -18,6 +40,10 @@ def _ensure_deps():
     except ImportError: needed.append("beautifulsoup4")
     try: import requests
     except ImportError: needed.append("requests")
+    try: import psutil
+    except ImportError: needed.append("psutil")
+    try: import openpyxl
+    except ImportError: needed.append("openpyxl")
 
     if needed:
         try:
@@ -991,14 +1017,13 @@ def parse_plain_text_page(text, excl, brand_domain=""):
 
 def scrape_page(url, excl, log, prog, timeout=18, retries=3):
     # Auto-detect brand domain from URL and exclude it from emails
-    # e.g. ligier.fr/reseau → exclude @ligier.fr, @ligier.com etc.
+    brand_domain = ""  # always defined — used throughout this function
     try:
         brand_host = re.match(r"https?://(?:www\.)?([^/]+)", url).group(1)
-        brand_name = brand_host.split(".")[0].lower()  # "ligier", "aixam", etc.
-        # Add brand domain variants to excl
-        brand_excl = [brand_name + "."]  # matches ligier.fr, ligier.com, ligier.net...
+        brand_domain = brand_host.split(".")[0].lower()  # "ligier", "aixam", etc.
+        brand_excl = [brand_domain + "."]
         excl = list(excl) + [b for b in brand_excl if b not in excl]
-        log(f"✓ Domaine marque exclu : {brand_name}.*")
+        log(f"✓ Domaine marque exclu : {brand_domain}.*")
     except Exception:
         pass
     prog(5, "Chargement de la page…")
@@ -1303,8 +1328,9 @@ class App(tk.Tk):
         self.retries_v = tk.IntVar(value=3)
         self.inc_no    = tk.BooleanVar(value=True)
         self.open_csv  = tk.BooleanVar(value=False)
-        self._anim_id  = None
-        self._tick     = 0
+        self._anim_id    = None
+        self._tick       = 0
+        self._max_threads= SYSTEM["threads"]  # set by perf mode
 
         self.configure(bg=W)
         self.title("Silence.eco — Dealer Finder")
@@ -1491,6 +1517,22 @@ class App(tk.Tk):
         self._hunter_dot.create_oval(0, 0, 7, 7, fill=GN, outline="")
         tk.Label(hp, text="Hunter.io actif", bg=GL, fg=GN,
                  font=(FONT, 8, "bold")).pack(side="left")
+
+        # Performance mode badge
+        PERF_COLORS = {
+            "eco":    ("#F1F5F9","#64748B"),
+            "normal": ("#F0F9FF","#2563EB"),
+            "rapide": ("#FFF7ED","#EA580C"),
+            "turbo":  ("#FFF1F2","#E8192C"),
+        }
+        PERF_ICONS = {"eco":"🐢","normal":"⚡","rapide":"🚀","turbo":"🔥"}
+        mode = SYSTEM["mode"]
+        pbg, pfg = PERF_COLORS.get(mode, PERF_COLORS["normal"])
+        perf_pill = tk.Frame(pills, bg=pbg, padx=10, pady=5)
+        perf_pill.pack(side="left", padx=(0,8))
+        tk.Label(perf_pill,
+                 text=f"{PERF_ICONS[mode]} Mode {mode.capitalize()} · {SYSTEM['threads']} threads",
+                 bg=pbg, fg=pfg, font=(FONT, 8, "bold")).pack()
 
         self._pause_pill = tk.Frame(pills, bg=AL, padx=10, pady=5)
         tk.Label(self._pause_pill, text="⏸  En pause",
@@ -1835,6 +1877,23 @@ class App(tk.Tk):
         self._anim_id = self.after(70, self._anim_loop)
 
     # ── Pause ──────────────────────────────────────────────────────────────
+    def _apply_perf_mode(self):
+        """Apply selected performance mode — update threads and delay."""
+        PERF = {
+            "eco":    {"threads": 2,  "delay": 1.2, "info": "2 threads · délai 1.2s · PC sous charge minimale"},
+            "normal": {"threads": 6,  "delay": 0.6, "info": "6 threads · délai 0.6s · Bon équilibre vitesse/stabilité"},
+            "rapide": {"threads": 10, "delay": 0.3, "info": "10 threads · délai 0.3s · PC 4+ cœurs recommandé"},
+            "turbo":  {"threads": 16, "delay": 0.15,"info": "16 threads · délai 0.15s · PC 8+ cœurs recommandé"},
+        }
+        mode = self._perf_mode.get()
+        cfg  = PERF.get(mode, PERF["normal"])
+        self._max_threads = cfg["threads"]
+        self.delay.set(cfg["delay"])
+        try:
+            self._perf_info.configure(text=f"  {cfg['info']}")
+        except Exception:
+            pass
+
     def _toggle_pause(self):
         if not self._run: return
         self._paused = not self._paused
@@ -1928,6 +1987,7 @@ class App(tk.Tk):
             to = self.timeout_v.get()
             rt = self.retries_v.get()
             dly = self.delay.get()
+            log(f"⚡ Mode {self._perf_mode.get().upper()} · {self._max_threads} threads parallèles · délai {dly}s")
 
             dealers = self._SP(url, excl, self._log_add,
                                self._set_prog, timeout=to, retries=rt)
@@ -1980,8 +2040,8 @@ class App(tk.Tk):
                     t = threading.Thread(target=do_one, args=(d,),
                                          daemon=True)
                     threads.append(t); t.start()
-                    while sum(1 for x in threads if x.is_alive()) >= 4:
-                        time.sleep(0.3)
+                    while sum(1 for x in threads if x.is_alive()) >= self._max_threads:
+                        time.sleep(0.2)
                 for t in threads: t.join(timeout=40)
 
             if self._v2.get():
