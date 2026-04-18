@@ -1942,3 +1942,87 @@ if __name__ == "__main__":
         EMAIL_RE     = EMAIL_RE,
     )
     app.mainloop()
+BAD_DOMAINS = [
+    "sollyazar.","allianz.","axa.","maif.","macif.","generali.",
+    "mma.","groupama.","covea.","april.","bnpparibas.","lcl.",
+    "google.","bing.","facebook.","instagram.","twitter.",
+    "linkedin.","youtube.","indeed.","monster.",
+    "pagesjaunes.","societe.com","verif.com","pappers.",
+    "w3.org","schema.org","cloudflare.","clubmobilite.",
+]
+FREE_PROVIDERS = {
+    "gmail","orange","hotmail","yahoo","outlook","sfr",
+    "wanadoo","free","laposte","bbox","live","icloud","msn"
+}
+STOPWORDS = {
+    "le","la","les","de","du","des","et","en","au","aux",
+    "sur","par","pour","avec","dans","store","partner","service","group",
+    "sarl","sas","eurl"
+}
+
+def email_belongs_to_dealer(email, dealer_name, source="search"):
+    """
+    Generic validation based on email SOURCE.
+
+    source="page"   → on official constructor page → always valid
+    source="site"   → on dealer's own website → always valid
+    source="hunter" → Hunter.io same domain → always valid
+    source="search" → found via web search → validate by name proximity
+    """
+    if not email or "@" not in email or len(email) < 6:
+        return False, "email invalide"
+
+    dom_full = email.split("@")[-1].lower()
+
+    # Always reject blacklisted domains
+    if any(p in dom_full for p in BAD_DOMAINS):
+        return False, "domaine blacklisté"
+
+    # Trusted sources — no further check needed
+    if source in ("page", "site", "hunter"):
+        return True, f"source fiable ({source})"
+
+    # === Search result: validate by name match ===
+    local    = normalize(email.split("@")[0])
+    dom      = normalize(email.split("@")[-1].split(".")[0])
+    is_free  = email.split("@")[-1].split(".")[0].lower() in FREE_PROVIDERS
+
+    # Build keywords: all words ≥ 2 chars, minus generic stopwords
+    name_words = []
+    for w in re.split(r"[\s\-\'&/,.(\[\]!?)]", dealer_name):
+        nw = normalize(w)
+        if len(nw) >= 2 and nw not in STOPWORDS:
+            name_words.append(nw)
+    # Add full normalized name and name without brand prefix
+    clean = re.sub(r"^(Ligier\s+(Store|Partner|Service)\s*)",
+                   "", dealer_name, flags=re.I).strip()
+    for extra in [normalize(dealer_name), normalize(clean)]:
+        if extra and extra not in name_words:
+            name_words.append(extra)
+    name_words = list(dict.fromkeys(name_words))
+
+    # Rule 1: any name keyword in local or domain
+    for word in name_words:
+        if len(word) >= 2 and word in local:
+            return True, f"'{word}' dans préfixe"
+        if len(word) >= 2 and word in dom:
+            return True, f"'{word}' dans domaine"
+
+    # Rule 2: inclusion — domain in local or local in domain
+    if len(dom) >= 4 and dom in local:
+        return True, "domaine inclus dans préfixe"
+    if len(local) >= 4 and local in dom:
+        return True, "préfixe inclus dans domaine"
+
+    # Rule 3: character overlap (business domains only, not free providers)
+    if not is_free:
+        name_joined = "".join(name_words[:6])
+        if len(name_joined) >= 4 and len(local) >= 4:
+            overlap = sum(1 for c in local if c in name_joined)
+            ratio   = overlap / max(len(local), len(name_joined))
+            if ratio >= 0.55:
+                return True, f"similarité {ratio:.0%}"
+
+    return False, "aucun lien avec le concessionnaire"
+
+
