@@ -843,7 +843,7 @@ def check_gouv(name, addr, log):
         return set(), "", "", ""
 
 
-def enrich_dealer(dealer, excl, log, delay=0.8, timeout=15):
+def enrich_dealer(dealer, excl, log, delay=0.8, timeout=15, brand_domain=""):
     """
     Enrichment pipeline:
     1. Direct Google search "name email" → fastest
@@ -902,7 +902,105 @@ def enrich_dealer(dealer, excl, log, delay=0.8, timeout=15):
     return {e: r for e, r in all_em.items() if is_real(e)}, src
 
 
+
+def parse_plain_text_page(text, excl, brand_domain=""):
+    dealers = []
+    SKIP = {
+        "distributeur","réparateur","reparateur","facebook","instagram",
+        "twitter","voir la fiche","voir la carte","map","linkedin",
+        "tiktok","youtube","x","snapchat","localiser","géolocalisation",
+        "geolocalisation","localisez-moi","filtre marque",
+        "particulier","professionnel","mon compte","réseau","faq"
+    }
+    P2 = re.compile(r"(?:\+33|\+34|\+689|0)[\s.\-]?[1-9](?:[\s.\-]?\d{2}){4}")
+    raw_blocks = text.split("Voir la fiche")
+    for block in raw_blocks:
+        lines = [l.strip() for l in block.split("\n") if l.strip()]
+        if len(lines) < 2:
+            continue
+        name = ""
+        addr_parts = []
+        phone = ""
+        email = ""
+        website = ""
+        i = 0
+        while i < len(lines):
+            l = lines[i]
+            if (re.search(r"voiture sans permis", l, re.I) or
+                    re.search(r"\(\d{1,3}[AB]?\)", l) or
+                    l.lower() in SKIP):
+                i += 1
+                continue
+            break
+        if i >= len(lines):
+            continue
+        candidate = lines[i]
+        if (candidate.lower() in SKIP or
+                candidate.startswith("http") or
+                EMAIL_RE.search(candidate) or
+                P2.match(candidate) or
+                len(candidate) < 3 or len(candidate) > 120 or
+                re.match(r"^\d+$", candidate)):
+            continue
+        name = candidate
+        i += 1
+        for line in lines[i:]:
+            ll = line.lower().strip()
+            if ll in SKIP:
+                continue
+            if line.lower().startswith("http"):
+                if not website:
+                    website = line.strip()
+                continue
+            em = EMAIL_RE.search(line)
+            if em:
+                e = em.group(0).lower()
+                dom = e.split("@")[-1].lower()
+                if brand_domain and brand_domain in dom:
+                    continue
+                if not email:
+                    email = e
+                continue
+            ph = P2.search(line)
+            if ph and not phone:
+                phone = ph.group(0)
+                continue
+            if re.search(r"\d{5}", line):
+                addr_parts.append(line)
+            elif re.search(r"^\d+[\s,]", line) and len(line) < 80:
+                addr_parts.append(line)
+            elif re.match(r"^[A-Z\u00C0-\u00DC\s\-]{4,}$", line) and len(line) < 40:
+                addr_parts.append(line)
+            elif addr_parts and len(line) < 80 and not re.match(r"^\d+$", line):
+                addr_parts.append(line)
+        addr = " ".join(addr_parts)[:150]
+        if not name or len(name) < 3:
+            continue
+        scored = {}
+        if email:
+            scored[email] = f"{guess_role(email)} [98%]"
+        dealers.append({
+            "name": name[:80], "addr": addr, "phone": phone,
+            "website": website, "profile_url": "",
+            "emails": scored,
+            "src": "page" if scored else "pending",
+            "siret": "", "naf": "",
+        })
+    return dealers
+
+
 def scrape_page(url, excl, log, prog, timeout=18, retries=3):
+    # Auto-detect brand domain from URL and exclude it from emails
+    # e.g. ligier.fr/reseau → exclude @ligier.fr, @ligier.com etc.
+    try:
+        brand_host = re.match(r"https?://(?:www\.)?([^/]+)", url).group(1)
+        brand_name = brand_host.split(".")[0].lower()  # "ligier", "aixam", etc.
+        # Add brand domain variants to excl
+        brand_excl = [brand_name + "."]  # matches ligier.fr, ligier.com, ligier.net...
+        excl = list(excl) + [b for b in brand_excl if b not in excl]
+        log(f"✓ Domaine marque exclu : {brand_name}.*")
+    except Exception:
+        pass
     prog(5, "Chargement de la page…")
     log(f"GET {url}")
     html = fetch(url, timeout=timeout, retries=retries)
@@ -1063,7 +1161,20 @@ def scrape_page(url, excl, log, prog, timeout=18, retries=3):
                     "src": "page" if pg else "pending",
                 })
 
-        # ── Méthode 3 : fallback blocs avec téléphone ──────────────────────
+        # ── Méthode 3 : texte brut (Ligier-style, sans h3) ─────────────────
+        page_emails = sum(len(d["emails"]) for d in dealers)
+        if len(dealers) < 5 or page_emails == 0:
+            full_text = soup.get_text("\n", strip=True)
+            pt = parse_plain_text_page(full_text, excl, brand_domain=brand_domain)
+            if len(pt) >= 3:
+                log(f"  Texte brut: {len(pt)} concessionnaires")
+                seen = {re.sub(r"[^a-z0-9]","",d["name"].lower())[:20] for d in dealers}
+                for d in pt:
+                    key = re.sub(r"[^a-z0-9]","",d["name"].lower())[:20]
+                    if key not in seen:
+                        dealers.append(d); seen.add(key)
+
+        # ── Méthode 4 : fallback blocs avec téléphone ──────────────────────
         if len(dealers) < 5:
             log("Fallback blocs téléphone…")
             for blk in soup.find_all(["div","li","article","p","section"]):
@@ -1802,6 +1913,13 @@ class App(tk.Tk):
         self._gouv_frame.pack_forget()
         self._start_anim()
         excl = self.excl if self._v3.get() else []
+        # Auto-detect brand domain from URL for exclusion
+        try:
+            import re as _re
+            host = _re.match(r"https?://(?:www\.)?([^/]+)", url).group(1)
+            self._brand_domain = host.split(".")[0].lower()
+        except Exception:
+            self._brand_domain = ""
         threading.Thread(target=self._worker, args=(url, excl),
                          daemon=True).start()
 
@@ -1833,7 +1951,8 @@ class App(tk.Tk):
                     self._pause_ev.wait()
                     try:
                         em, src = self._ED(d, excl, self._log_add,
-                                           delay=dly, timeout=to)
+                                           delay=dly, timeout=to,
+                                           brand_domain=getattr(self, "_brand_domain", ""))
                         if em: d["emails"] = em; d["src"] = src
                     except Exception as e:
                         self._log_add(f"  ⚠  {d['name'][:30]}: {e}")
@@ -2042,7 +2161,8 @@ BAD_DOMAINS = [
     "w3.org","schema.org","cloudflare.","sentry.",
 ]
 
-def score_email(email, dealer_name, source="search"):
+def score_email(email, dealer_name, source="search", brand_domain=""):
+    """brand_domain: e.g. 'ligier' — emails @ligier.* are excluded as manufacturer emails"""
     """
     Score de probabilité 0-100 qu'un email appartient au concessionnaire.
     Aucun email n'est jamais bloqué (sauf domaines blacklistés).
@@ -2059,6 +2179,9 @@ def score_email(email, dealer_name, source="search"):
     dom_full = email.split("@")[-1].lower()
     if any(p in dom_full for p in BAD_DOMAINS):
         return 0, "domaine blacklisté"
+    # Exclude manufacturer/brand emails (e.g. @ligier.fr when scraping Ligier network)
+    if brand_domain and brand_domain.lower() in dom_full:
+        return 0, f"email du constructeur ({brand_domain}) — exclu"
 
     # ── Sources fiables → score élevé garanti ────────────────────────────
     if source == "page":    return 98, "page officielle constructeur ★★★"
