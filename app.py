@@ -724,25 +724,76 @@ def google_search_emails(name, addr, excl, log):
     return set()
 
 
+# Vehicle activity codes L6e/L7e (light quadricycles, microcars)
+VEHICLE_CODES = {
+    "45.11", "45.19", "45.20", "45.31", "45.32", "45.40",  # auto trade/repair
+    "29.10", "30.91", "30.92",  # vehicle manufacturing
+    "77.11", "77.12",           # vehicle rental
+}
+
 def check_gouv(name, addr, log):
-    """Search annuaire-entreprises.data.gouv.fr — official French business directory."""
+    """
+    Search annuaire-entreprises.data.gouv.fr (official French gov API).
+    Returns (emails set, siret, activity_code, verified_address)
+    """
     city = ""
     if addr:
-        import re as _re
-        m = _re.search(r"\d{5}\s+(\S+)", addr)
+        m = re.search(r"\d{5}\s+(\S+)", addr)
         if m: city = m.group(1)
+    postcode = ""
+    if addr:
+        m2 = re.search(r"(\d{5})", addr)
+        if m2: postcode = m2.group(1)
+
+    # Clean name — remove brand prefix
+    clean = re.sub(r"^(Ligier\s+(Store|Partner|Service)\s*)", "", name, flags=re.I).strip()
+    clean = re.split(r"\s+-\s+", clean)[0].strip()
+
     try:
-        q = urllib.parse.quote(f"{name} {city}".strip())
-        url = f"https://annuaire-entreprises.data.gouv.fr/recherche?terme={q}"
-        log(f"  🏛️  data.gouv.fr: {name[:35]}")
-        html = fetch(url, timeout=12, ref="https://annuaire-entreprises.data.gouv.fr")
-        emails = get_emails(html)
-        if emails:
-            for e in sorted(emails)[:3]:
-                log(f"  ✅ [gouv.fr] {e}")
-        return emails
-    except Exception:
-        return set()
+        # Use the official API (JSON)
+        q = urllib.parse.quote(f"{clean} {city}".strip())
+        api_url = f"https://recherche-entreprises.api.gouv.fr/search?q={q}&page=1&per_page=5"
+        log(f"  🏛️  Annuaire officiel: {clean[:35]}")
+        data_str = fetch(api_url, timeout=12, ref="https://annuaire-entreprises.data.gouv.fr")
+        data = json.loads(data_str)
+
+        results = data.get("results", [])
+        for r in results:
+            siret     = r.get("siren", "")
+            siege     = r.get("siege", {})
+            code_naf  = siege.get("activite_principale", "") or r.get("activite_principale", "")
+            adresse   = siege.get("adresse", "")
+            cp        = siege.get("code_postal", "")
+            nom_comp  = r.get("nom_complet", "") or r.get("nom_raison_sociale", "")
+
+            # Verify it's a vehicle dealer (NAF code starts with 45)
+            is_vehicle = code_naf.startswith("45") or code_naf[:5] in VEHICLE_CODES
+
+            # Check city/postcode match if we have one
+            city_match = (not postcode) or (cp == postcode) or (city.upper()[:4] in adresse.upper()[:30])
+
+            if city_match:
+                log(f"  ✓ Trouvé: {nom_comp[:40]} | SIRET: {siret} | NAF: {code_naf}")
+                if not is_vehicle:
+                    log(f"  ↳ Code NAF {code_naf} — pas un concessionnaire véhicule")
+
+                # Fetch the full company page for email
+                if siret:
+                    try:
+                        page_url = f"https://annuaire-entreprises.data.gouv.fr/entreprise/{siret}"
+                        html = fetch(page_url, timeout=10, ref="https://annuaire-entreprises.data.gouv.fr")
+                        emails = get_emails(html)
+                        if emails:
+                            for e in sorted(emails)[:3]:
+                                log(f"  ✅ [gouv.fr] {e}")
+                            return emails, siret, code_naf, adresse
+                    except Exception:
+                        pass
+                return set(), siret, code_naf, adresse
+        return set(), "", "", ""
+    except Exception as e:
+        log(f"  ↳ gouv.fr: {str(e)[:40]}")
+        return set(), "", "", ""
 
 
 def enrich_dealer(dealer, excl, log, delay=0.8, timeout=15):
@@ -1719,6 +1770,14 @@ class App(tk.Tk):
                                 pct,
                                 f"{done[0]}/{len(dealers)}"
                                 f"  —  {d['name'][:32]}")
+                            # ── Live results update ────────────────────
+                            self.results = list(dealers)
+                            em_total = sum(len(x["emails"]) for x in dealers)
+                            self._sv["s1"].set(str(len(dealers)))
+                            self._sv["s2"].set(str(em_total))
+                            self._sv["s3"].set(str(sum(1 for x in dealers if x["src"] in ("web","hunter"))))
+                            self._sv["s4"].set(str(sum(1 for x in dealers if x["addr"])))
+                            self.after(0, self._render)
 
                 threads = []
                 for d in dealers:
@@ -1829,28 +1888,39 @@ class App(tk.Tk):
         date_s = datetime.now().strftime("%d/%m/%Y"); rows = 0
         with open(fpath, "w", newline="", encoding="utf-8-sig") as fp:
             w = csv.writer(fp)
-            w.writerow([self.L("col_name"), self.L("col_addr"),
-                        self.L("col_phone"), self.L("col_email"),
-                        self.L("col_role"), "Site web",
-                        self.L("col_src"), "Date"])
+            w.writerow(["Concessionnaire", "Adresse", "Code Postal",
+                        "Ville", "Téléphone", "Email", "Rôle / Contact",
+                        "Site web", "SIRET", "Code NAF", "Source", "Date"])
             for x in self.results:
                 if not x["emails"] and not self.inc_no.get(): continue
                 sl = sm.get(x["src"], "—")
                 site = x.get("website", "")
+                # Split address into parts
+                addr_full = x.get("addr","")
+                cp_match = re.search(r"(\d{5})\s*(.*)", addr_full)
+                cp   = cp_match.group(1) if cp_match else ""
+                city = cp_match.group(2).strip()[:30] if cp_match else ""
+                addr_street = addr_full[:addr_full.find(cp)].strip(" ,") if cp and cp in addr_full else addr_full
+                siret = x.get("siret",""); naf = x.get("naf","")
+
                 if not x["emails"]:
-                    w.writerow([x["name"],x["addr"],x["phone"],
-                                "","",site,sl,date_s]); rows += 1
+                    w.writerow([x["name"], addr_street, cp, city,
+                                x["phone"],"","",site,siret,naf,sl,date_s])
+                    rows += 1
                 else:
-                    for i,(email,role) in enumerate(
-                            sorted(x["emails"].items())):
+                    for i,(email,role) in enumerate(sorted(x["emails"].items())):
                         w.writerow([
-                            x["name"]  if i==0 else "",
-                            x["addr"]  if i==0 else "",
-                            x["phone"] if i==0 else "",
+                            x["name"]        if i==0 else "",
+                            addr_street      if i==0 else "",
+                            cp               if i==0 else "",
+                            city             if i==0 else "",
+                            x["phone"]       if i==0 else "",
                             email, role,
-                            site       if i==0 else "",
-                            sl         if i==0 else "",
-                            date_s     if i==0 else ""])
+                            site             if i==0 else "",
+                            siret            if i==0 else "",
+                            naf              if i==0 else "",
+                            sl               if i==0 else "",
+                            date_s           if i==0 else ""])
                         rows += 1
         messagebox.showinfo(
             "✓", f"{self.L('export_ok')}\n{fname}\n\n{rows} lignes")
