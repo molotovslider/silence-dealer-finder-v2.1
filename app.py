@@ -2087,57 +2087,226 @@ class App(tk.Tk):
     def _export(self):
         if not self.results:
             messagebox.showinfo("", self.L("no_copy")); return
-        desk = os.path.join(os.path.expanduser("~"), "Desktop")
-        os.makedirs(desk, exist_ok=True)
-        fname = f"silence_dealers_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.csv"
-        fpath = os.path.join(desk, fname)
-        sm = {"page": self.L("src_page"),
-              "web":  self.L("src_web"),
-              "hunter": self.L("src_hunter")}
-        date_s = datetime.now().strftime("%d/%m/%Y"); rows = 0
-        with open(fpath, "w", newline="", encoding="utf-8-sig") as fp:
-            w = csv.writer(fp)
-            w.writerow(["Concessionnaire", "Adresse", "Code Postal",
-                        "Ville", "Téléphone", "Email", "Rôle / Contact",
-                        "Site web", "SIRET", "Code NAF", "Source", "Date"])
-            for x in self.results:
-                if not x["emails"] and not self.inc_no.get(): continue
-                sl = sm.get(x["src"], "—")
-                site = x.get("website", "")
-                # Split address into parts
-                addr_full = x.get("addr","")
-                cp_match = re.search(r"(\d{5})\s*(.*)", addr_full)
-                cp   = cp_match.group(1) if cp_match else ""
-                city = cp_match.group(2).strip()[:30] if cp_match else ""
-                addr_street = addr_full[:addr_full.find(cp)].strip(" ,") if cp and cp in addr_full else addr_full
-                siret = x.get("siret",""); naf = x.get("naf","")
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import (Font, PatternFill, Alignment,
+                                          Border, Side, GradientFill)
+            from openpyxl.utils import get_column_letter
+        except ImportError:
+            messagebox.showerror("", "Module openpyxl manquant.\npip install openpyxl")
+            return
 
-                if not x["emails"]:
-                    w.writerow([x["name"], addr_street, cp, city,
-                                x["phone"],"","",site,siret,naf,sl,date_s])
-                    rows += 1
+        desk  = os.path.join(os.path.expanduser("~"), "Desktop")
+        os.makedirs(desk, exist_ok=True)
+        fname = f"silence_dealers_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.xlsx"
+        fpath = os.path.join(desk, fname)
+
+        # ── Styles ──────────────────────────────────────────────────────
+        RED    = "E8192C"
+        WHITE  = "FFFFFF"
+        DARK   = "111118"
+        GRAY1  = "F7F7F8"   # alternating row light
+        GRAY2  = "FFFFFF"   # alternating row white
+        BORDCOL= "E4E4E7"
+        GREEN_LT = "F0FDF4"
+        RED_LT   = "FFF1F2"
+        AMBER_LT = "FFFBEB"
+
+        hdr_font  = Font(name="Arial", bold=True, size=10, color=WHITE)
+        hdr_fill  = PatternFill("solid", fgColor=RED)
+        hdr_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        thin = Side(style="thin", color=BORDCOL)
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+        title_font = Font(name="Arial", bold=True, size=14, color=DARK)
+        sub_font   = Font(name="Arial", size=9, color="888890", italic=True)
+        cell_font  = Font(name="Arial", size=9, color=DARK)
+        cell_align = Alignment(vertical="center", wrap_text=False)
+        cell_align_wrap = Alignment(vertical="center", wrap_text=True)
+        link_font  = Font(name="Arial", size=9, color="2563EB", underline="single")
+
+        def make_fill(hex_color):
+            return PatternFill("solid", fgColor=hex_color)
+
+        # ── Workbook ────────────────────────────────────────────────────
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Concessionnaires"
+        ws.sheet_view.showGridLines = False
+        ws.freeze_panes = "A4"  # freeze title rows
+
+        # ── Title block (rows 1–2) ───────────────────────────────────────
+        ws.merge_cells("A1:L1")
+        t = ws["A1"]
+        t.value = f"SILENCE.ECO — Réseau Concessionnaires  ·  {datetime.now().strftime('%d/%m/%Y')}"
+        t.font  = title_font
+        t.fill  = make_fill("FFFFFF")
+        t.alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[1].height = 30
+
+        total_em = sum(len(x["emails"]) for x in self.results)
+        total_ad = sum(1 for x in self.results if x.get("addr"))
+        ws.merge_cells("A2:L2")
+        s = ws["A2"]
+        s.value = (f"{len(self.results)} concessionnaires  ·  "
+                   f"{total_em} emails trouvés  ·  "
+                   f"{total_ad} adresses  ·  "
+                   f"Export Silence Dealer Finder")
+        s.font      = sub_font
+        s.alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[2].height = 18
+
+        # ── Headers (row 3) ─────────────────────────────────────────────
+        COLS = [
+            ("#",              4),
+            ("Concessionnaire",32),
+            ("Adresse",        28),
+            ("CP",              7),
+            ("Ville",          18),
+            ("Téléphone",      14),
+            ("Email",          30),
+            ("Confiance",       9),
+            ("Rôle",           16),
+            ("Site web",       26),
+            ("SIRET",          16),
+            ("Source",         10),
+        ]
+        for col_i, (header, width) in enumerate(COLS, 1):
+            cell = ws.cell(row=3, column=col_i, value=header)
+            cell.font      = hdr_font
+            cell.fill      = hdr_fill
+            cell.alignment = hdr_align
+            cell.border    = border
+            ws.column_dimensions[get_column_letter(col_i)].width = width
+        ws.row_dimensions[3].height = 22
+
+        # ── Data rows ────────────────────────────────────────────────────
+        sm = {"page": "Page", "web": "Site web", "hunter": "Hunter.io"}
+        row_num = 4
+        dealer_num = 1
+
+        for x in self.results:
+            if not x["emails"] and not self.inc_no.get():
+                continue
+
+            addr_full = x.get("addr", "")
+            cp_m = re.search(r"(\d{5})\s*(.*)", addr_full)
+            cp   = cp_m.group(1) if cp_m else ""
+            city = (cp_m.group(2).strip()[:30] if cp_m else "").upper()
+            addr_street = addr_full[:addr_full.find(cp)].strip(" ,") if cp and cp in addr_full else addr_full
+            siret  = x.get("siret", "")
+            site   = x.get("website", "")
+            source = sm.get(x.get("src",""), "—")
+
+            emails = sorted(x["emails"].items()) if x["emails"] else [("—", "—")]
+            first_row = row_num
+
+            for i, (email, role) in enumerate(emails):
+                # Row fill: alternating, with special tint for score
+                score_m = re.search(r"\[(\d+)%\]", role)
+                score_v = int(score_m.group(1)) if score_m else 0
+                if email == "—":
+                    bg = GRAY1 if dealer_num % 2 == 0 else GRAY2
+                elif score_v >= 90:
+                    bg = "F0FDF4"   # green tint
+                elif score_v >= 70:
+                    bg = "F0F9FF"   # blue tint
+                elif score_v >= 40:
+                    bg = GRAY1 if dealer_num % 2 == 0 else GRAY2
                 else:
-                    for i,(email,role) in enumerate(sorted(x["emails"].items())):
-                        w.writerow([
-                            x["name"]        if i==0 else "",
-                            addr_street      if i==0 else "",
-                            cp               if i==0 else "",
-                            city             if i==0 else "",
-                            x["phone"]       if i==0 else "",
-                            email, role,
-                            site             if i==0 else "",
-                            siret            if i==0 else "",
-                            naf              if i==0 else "",
-                            sl               if i==0 else "",
-                            date_s           if i==0 else ""])
-                        rows += 1
-        messagebox.showinfo(
-            "✓", f"{self.L('export_ok')}\n{fname}\n\n{rows} lignes")
-        if self.open_csv.get():
-            try: os.startfile(fpath)
-            except Exception:
-                try: os.system(f'open "{fpath}"')
-                except Exception: pass
+                    bg = "FFFBEB"   # amber tint (low confidence)
+
+                row_fill = make_fill(bg)
+
+                def wc(col, val, wrap=False, is_link=False):
+                    c = ws.cell(row=row_num, column=col, value=val)
+                    c.fill   = row_fill
+                    c.border = border
+                    c.font   = link_font if is_link else cell_font
+                    c.alignment = cell_align_wrap if wrap else cell_align
+                    return c
+
+                # Col 1: # (only first row of dealer)
+                wc(1, dealer_num if i == 0 else "").alignment = Alignment(horizontal="center", vertical="center")
+                wc(2, x["name"]   if i == 0 else "")
+                wc(3, addr_street if i == 0 else "", wrap=True)
+                wc(4, cp          if i == 0 else "").alignment = Alignment(horizontal="center", vertical="center")
+                wc(5, city        if i == 0 else "")
+                wc(6, x.get("phone","") if i == 0 else "").alignment = Alignment(horizontal="center", vertical="center")
+                # Email
+                wc(7, email if email != "—" else "", is_link=(email != "—" and "@" in email))
+                # Score
+                score_display = f"{score_v}%" if score_v > 0 and email != "—" else ""
+                sc = wc(8, score_display)
+                sc.alignment = Alignment(horizontal="center", vertical="center")
+                if score_v >= 90:   sc.font = Font(name="Arial", size=9, bold=True, color="16A34A")
+                elif score_v >= 70: sc.font = Font(name="Arial", size=9, color="2563EB")
+                elif score_v >= 40: sc.font = Font(name="Arial", size=9, color="D97706")
+                elif score_v > 0:   sc.font = Font(name="Arial", size=9, color="9A3412")
+                # Role (strip score from display)
+                role_clean = re.sub(r"\s*\[\d+%\]", "", role).strip() if role != "—" else ""
+                wc(9, role_clean if i == 0 or role_clean else "")
+                # Website (clickable)
+                site_cell = wc(10, site if i == 0 else "", is_link=bool(site and i == 0))
+                if site and i == 0:
+                    ws.cell(row=row_num, column=10).hyperlink = site
+                # SIRET
+                wc(11, siret if i == 0 else "")
+                # Source
+                src_cell = wc(12, source if i == 0 else "")
+                src_cell.alignment = Alignment(horizontal="center", vertical="center")
+
+                ws.row_dimensions[row_num].height = 18
+                row_num += 1
+
+            dealer_num += 1
+
+        # ── Auto-filter on header row ────────────────────────────────────
+        ws.auto_filter.ref = f"A3:L{row_num - 1}"
+
+        # ── Legend sheet ────────────────────────────────────────────────
+        wl = wb.create_sheet("Légende")
+        wl.sheet_view.showGridLines = False
+        wl.column_dimensions["A"].width = 14
+        wl.column_dimensions["B"].width = 40
+
+        legend_title = wl["A1"]
+        legend_title.value = "Légende — Score de confiance email"
+        legend_title.font  = Font(name="Arial", bold=True, size=12, color=DARK)
+        wl.merge_cells("A1:B1")
+        wl.row_dimensions[1].height = 26
+
+        legend_rows = [
+            ("≥ 90%  ★★★", "Certitude — source officielle ou nom exact dans l'email",      "F0FDF4", "16A34A"),
+            ("70-89% ★★",  "Très probable — mot-clé du nom dans le préfixe/domaine",          "F0F9FF", "2563EB"),
+            ("40-69% ★",   "Possible — préfixe pro sur domaine lié",                           "FFFBEB", "D97706"),
+            ("< 40%  ·",   "Faible — nom de personne, employé possible",                       "FFF5F5", "9A3412"),
+            ("0%     ✗",   "Exclu — domaine blacklisté (assurance, plateforme, etc.)",          "F1F1F5", "888890"),
+        ]
+        for r_i, (score, desc, bg, txt) in enumerate(legend_rows, 2):
+            sc = wl.cell(row=r_i, column=1, value=score)
+            sc.font      = Font(name="Arial", bold=True, size=10, color=txt)
+            sc.fill      = PatternFill("solid", fgColor=bg)
+            sc.alignment = Alignment(horizontal="center", vertical="center")
+            sc.border    = border
+            dc = wl.cell(row=r_i, column=2, value=desc)
+            dc.font      = Font(name="Arial", size=9, color=DARK)
+            dc.fill      = PatternFill("solid", fgColor=bg)
+            dc.alignment = Alignment(vertical="center")
+            dc.border    = border
+            wl.row_dimensions[r_i].height = 20
+
+        # ── Save ─────────────────────────────────────────────────────────
+        wb.save(fpath)
+
+        rows = row_num - 4
+        messagebox.showinfo("✓", f"Export Excel sauvegardé :\n{fname}\n\n{rows} lignes exportées")
+        try:
+            os.startfile(fpath)
+        except Exception:
+            try: os.system(f'open "{fpath}"')
+            except Exception: pass
 
 norm = normalize  # alias
 
