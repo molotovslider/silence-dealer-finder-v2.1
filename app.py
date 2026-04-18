@@ -924,9 +924,19 @@ def scrape_page(url, excl, log, prog, timeout=18, retries=3):
                     if re.search(r"\d{5}", t2) and 5 < len(t2) < 200:
                         addr = t2[:120]; break
 
-            # Téléphone
+            # Téléphone — texte ET liens tel:
             phones = get_phones(btxt + " " + parent_txt)
-            phone  = phones[0] if phones else ""
+            if not phones:
+                for a in b.find_all("a", href=True):
+                    if a["href"].startswith("tel:"):
+                        num = a["href"][4:].strip()
+                        m = re.search(r"0\d{9}", num)
+                        if m:
+                            # Format: 06 12 34 56 78
+                            n = m.group(0)
+                            phones = [f"{n[:2]} {n[2:4]} {n[4:6]} {n[6:8]} {n[8:10]}"]
+                            break
+            phone = phones[0] if phones else ""
 
             # Emails visibles dans le bloc
             pg = get_emails(btxt + " " + parent_txt, excl)
@@ -1885,12 +1895,18 @@ class App(tk.Tk):
                     elif score_v >= 70: row_tag = "high"
                     elif score_v >= 40: row_tag = "medium"
                     else: row_tag = "low"
+                    # Extract score and prepend icon to email display
+                    import re as _re
+                    score_m = _re.search(r"\[(\d+)%\]", role)
+                    score_v = int(score_m.group(1)) if score_m else 50
+                    icon = "⭐⭐⭐" if score_v >= 90 else "⭐⭐" if score_v >= 70 else "⭐" if score_v >= 40 else "·"
+                    email_display = f"{icon} {email}"
                     self._tree.insert("", "end", tags=(row_tag,), values=(
                         n  if i==0 else "",
                         x["name"]  if i==0 else "",
                         x["addr"]  if i==0 else "",
                         x["phone"] if i==0 else "",
-                        email, role,
+                        email_display, role,
                         sl if i==0 else ""))
                 n += 1
 
