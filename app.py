@@ -1733,7 +1733,7 @@ class App(tk.Tk):
             if self._v2.get():
                 seen, uniq = set(), []
                 for d in dealers:
-                    k = self._NRM(d["name"])[:20]
+                    k = re.sub(r"[^a-z0-9]","",d["name"].lower())[:20]
                     if k not in seen: seen.add(k); uniq.append(d)
                 dealers = uniq
 
@@ -1860,13 +1860,15 @@ class App(tk.Tk):
                 try: os.system(f'open "{fpath}"')
                 except Exception: pass
 
+norm = normalize  # alias
+
 if __name__ == "__main__":
     app = App(
-        STRINGS     = T,
-        EXCL_DEFAULT= EXCL_DEFAULT,
-        scrape_page = scrape_page,
-        enrich_dealer = enrich_dealer,
-        norm        = norm,
-        EMAIL_RE    = EMAIL_RE,
+        STRINGS      = T,
+        EXCL_DEFAULT = EXCL_DEFAULT,
+        scrape_page  = scrape_page,
+        enrich_dealer= enrich_dealer,
+        norm         = norm,
+        EMAIL_RE     = EMAIL_RE,
     )
     app.mainloop()
