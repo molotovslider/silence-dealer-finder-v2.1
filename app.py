@@ -169,9 +169,6 @@ PLATFORM_SKIP = [
     "pappers.fr","wix.","squarespace.","shopify.","wordpress.","example.com",
     "test.com","noreply.","sentry.","w3.org","schema.org","cloudflare.",
     "microsoft.","apple.","amazon.","leboncoin.","lacentrale.","largus.",
-    # Insurance / finance — never a dealer email
-    "sollyazar.","allianz.","axa.","maif.","macif.","matmut.","generali.",
-    "mma.","groupama.","covea.","april.","bnpparibas.","lcl.","boursorama.",
 ]
 GENERIC_PREFIXES = ["info","contact","noreply","no-reply","admin","webmaster",
                     "postmaster","support","hello","bonjour","mailer"]
@@ -448,12 +445,12 @@ def email_matches_dealer(email, dealer_name, dealer_addr="", threshold=0.35):
 
     return False, 0, "email non lié au concessionnaire"
 
-def get_emails(text, excl=None, filter_generic=False):
+def get_emails(text, excl, filter_generic=False):
     out = set()
     for m in EMAIL_RE.finditer(text):
         e = m.group(0).lower().strip(".,;:<>\"'()")
         dom = e.split("@")[-1]
-        if is_real(e, filter_generic) and (not excl or not any(x in dom for x in excl)):
+        if not any(x in dom for x in excl) and is_real(e, filter_generic):
             out.add(e)
     return out
 
@@ -516,23 +513,25 @@ def find_dealer_domain(name, addr, log, delay=0.5):
     return ""
 
 def scrape_domain_emails(domain, excl, log, timeout=12):
+    """Scrape dealer website — ALL emails found are valid (it is their own site)."""
     found = set()
     pages = [
         f"https://{domain}", f"https://www.{domain}",
         f"https://{domain}/contact", f"https://www.{domain}/contact",
-        f"https://{domain}/nous-contacter", f"https://{domain}/contacto",
+        f"https://{domain}/nous-contacter", f"https://{domain}/contactez-nous",
+        f"https://{domain}/contact.html", f"https://{domain}/contacto",
         f"https://{domain}/contact-us",
     ]
-    base = domain.replace("www.", "")
     for page in pages:
         try:
             html = fetch(page, timeout=timeout, ref=f"https://{domain}")
-            same = get_emails(html)  # own site: all emails valid
-            if same:
-                found.update(same)
-                log(f"  Scrape {page}: {len(same)} email(s)")
+            # No excl filter — it's their own site, all emails are valid
+            emails = get_emails_raw(html)
+            if emails:
+                found.update(emails)
+                log(f"  ✅ [Site] {len(emails)} email(s) — {page.split('/')[-1] or domain}")
             if len(found) >= 10: break
-            time.sleep(random.uniform(0.4, 1.0))
+            time.sleep(random.uniform(0.3, 0.6))
         except Exception:
             continue
     return found
@@ -725,6 +724,27 @@ def google_search_emails(name, addr, excl, log):
     return set()
 
 
+def check_gouv(name, addr, log):
+    """Search annuaire-entreprises.data.gouv.fr — official French business directory."""
+    city = ""
+    if addr:
+        import re as _re
+        m = _re.search(r"\d{5}\s+(\S+)", addr)
+        if m: city = m.group(1)
+    try:
+        q = urllib.parse.quote(f"{name} {city}".strip())
+        url = f"https://annuaire-entreprises.data.gouv.fr/recherche?terme={q}"
+        log(f"  🏛️  data.gouv.fr: {name[:35]}")
+        html = fetch(url, timeout=12, ref="https://annuaire-entreprises.data.gouv.fr")
+        emails = get_emails(html)
+        if emails:
+            for e in sorted(emails)[:3]:
+                log(f"  ✅ [gouv.fr] {e}")
+        return emails
+    except Exception:
+        return set()
+
+
 def enrich_dealer(dealer, excl, log, delay=0.8, timeout=15):
     """
     Enrichment pipeline:
@@ -811,11 +831,16 @@ def scrape_page(url, excl, log, prog, timeout=18, retries=3):
             a_tag = h3.find("a")
             name  = (a_tag or h3).get_text(strip=True)
             if not name or len(name) < 3 or len(name) > 100: continue
-            skip_words = ("tél","tel","fax","email","adresse","voir","cliquer",
-                          "notre","les ","le ","la ","pour ","avec ","sans ",
-                          "tous","département","région","accueil","bienvenue")
-            if any(name.lower().startswith(w) for w in skip_words): continue
+            # ── Region/dept filter (runs first) ──────────────────────────
+            name_l = name.lower().strip()
+            if re.search(r"voiture sans permis", name_l): continue  # "Voiture sans permis - AIN (01)"
+            if re.search(r"\(\d{1,3}[AB]?\)", name): continue       # contains (01), (2B), etc.
             if re.match(r"^\d", name): continue
+            skip_words = ("tél","tel","fax","email","adresse","voir","cliquer",
+                          "notre","les ","le ","la ","pour ","avec ",
+                          "tous","département","région","accueil","bienvenue",
+                          "distributeur","réparateur","scooter","moto électrique")
+            if any(name_l.startswith(w) for w in skip_words): continue
 
             key = re.sub(r"[^a-z0-9]", "", name.lower())[:22]
             if not key or key in seen: continue
@@ -852,13 +877,13 @@ def scrape_page(url, excl, log, prog, timeout=18, retries=3):
             phones = get_phones(btxt + " " + parent_txt)
             phone  = phones[0] if phones else ""
 
-            # Page emails — NO excl filter, they are from the official page
-            pg = get_emails(btxt + " " + parent_txt)
+            # Emails visibles dans le bloc
+            pg = get_emails(btxt + " " + parent_txt, excl)
             for a in b.find_all("a", href=True):
                 h2 = a["href"]
                 if h2.startswith("mailto:"):
                     e = h2[7:].split("?")[0].strip().lower()
-                    if is_real(e):
+                    if is_real(e) and not any(x in e.split("@")[-1] for x in excl):
                         pg.add(e)
 
             # Lien fiche du concessionnaire
@@ -917,7 +942,7 @@ def scrape_page(url, excl, log, prog, timeout=18, retries=3):
                 seen.add(key)
                 am = ADDR_RE2.search(txt); addr = am.group(0).strip()[:120] if am else ""
                 phones = get_phones(txt); phone = phones[0] if phones else ""
-                pg = get_emails(txt)  # page: no excl filter
+                pg = get_emails(txt, excl)
                 for a in blk.find_all("a", href=True):
                     h2 = a["href"]
                     if h2.startswith("mailto:"):
@@ -947,7 +972,7 @@ def scrape_page(url, excl, log, prog, timeout=18, retries=3):
                 seen.add(key)
                 phones = get_phones(txt); phone = phones[0] if phones else ""
                 am = ADDR_RE2.search(txt); addr = am.group(0)[:120] if am else ""
-                pg = get_emails(txt)  # page: no excl filter
+                pg = get_emails(txt, excl)
                 dealers.append({
                     "name": name[:80], "addr": addr, "phone": phone,
                     "website": "", "profile_url": "",
@@ -1013,419 +1038,835 @@ def scrape_page(url, excl, log, prog, timeout=18, retries=3):
 # ══════════════════════════════════════════════════════════════════════════════
 #  GUI
 # ══════════════════════════════════════════════════════════════════════════════
-import math
 
-D = dict(
-    bg="#FFFFFF", sf="#F7F7F8", sf2="#EFEFEF",
-    bd="#E4E4E7", bd2="#D1D1D6",
-    red="#E8192C", rdh="#C41424", rlt="#FFF1F2",
-    dark="#09090B", t1="#18181B", t2="#52525B", t3="#A1A1AA",
-    grn="#16A34A", glt="#F0FDF4",
-    amb="#D97706", alt="#FFFBEB",
-)
+import math, threading, time, os, csv, re
+from datetime import datetime
+from tkinter import ttk, messagebox, scrolledtext
+import tkinter as tk
+
+# ── Palette ───────────────────────────────────────────────────────────────────
+R = "#E8192C"   # Silence red
+RH= "#C41424"   # red hover
+RL= "#FFF1F2"   # red light bg
+W = "#FFFFFF"   # white
+G1= "#F8F8FA"   # lightest surface
+G2= "#F1F1F5"   # input bg
+G3= "#E4E4EB"   # border
+G4= "#C4C4D0"   # border strong
+T1= "#111118"   # primary text
+T2= "#555566"   # secondary text
+T3= "#9999AA"   # muted text
+GN= "#16A34A"   # green
+GL= "#F0FDF4"   # green light
+AM= "#D97706"   # amber
+AL= "#FFFBEB"   # amber light
+
+FONT      = "Segoe UI"
+FONT_MONO = "Consolas"
 
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, STRINGS, EXCL_DEFAULT, scrape_page, enrich_dealer,
+                 norm, EMAIL_RE, T_dict=None):
         super().__init__()
-        self.lang="FR"; self.results=[]; self._run=False
-        self._paused=False; self._pev=threading.Event(); self._pev.set()
-        self.excl=list(EXCL_DEFAULT)
-        self.delay=tk.DoubleVar(value=0.8); self.timeout=tk.IntVar(value=18)
-        self.retries=tk.IntVar(value=3); self.inc_no=tk.BooleanVar(value=True)
-        self.open_csv=tk.BooleanVar(value=False)
-        self._aid=None; self._tick=0
-        self.configure(bg=D["bg"]); self.geometry("1120x760"); self.minsize(900,640)
-        self._build(); self._apply_lang()
+        self._SP  = scrape_page
+        self._ED  = enrich_dealer
+        self._NRM = norm
+        self.lang = "FR"
+        self.S    = STRINGS
+        self.results = []
+        self._run    = False
+        self._paused = False
+        self._pause_ev = threading.Event()
+        self._pause_ev.set()
+        self.excl      = list(EXCL_DEFAULT)
+        self.delay     = tk.DoubleVar(value=0.8)
+        self.timeout_v = tk.IntVar(value=18)
+        self.retries_v = tk.IntVar(value=3)
+        self.inc_no    = tk.BooleanVar(value=True)
+        self.open_csv  = tk.BooleanVar(value=False)
+        self._anim_id  = None
+        self._tick     = 0
 
-    def L(self,k): return T[self.lang].get(k,k)
+        self.configure(bg=W)
+        self.title("Silence.eco — Dealer Finder")
+        self.geometry("1140x780")
+        self.minsize(920, 640)
 
-    def _build(self):
-        self._sty(); self._hdr(); self._nb_build()
+        self._build_styles()
+        self._build_header()
+        self._build_nb()
+        self._apply_lang()
 
-    def _sty(self):
-        s=ttk.Style(self); s.theme_use("clam")
-        s.configure("TNotebook",background=D["bg"],borderwidth=0,tabmargins=0)
-        s.configure("TNotebook.Tab",background=D["bg"],foreground=D["t3"],
-                    padding=[22,11],font=("Segoe UI",10),borderwidth=0)
-        s.map("TNotebook.Tab",background=[("selected",D["bg"])],foreground=[("selected",D["t1"])])
-        s.configure("TFrame",background=D["bg"])
-        s.configure("P.Horizontal.TProgressbar",troughcolor=D["bd"],background=D["red"],borderwidth=0,thickness=3)
-        s.configure("Treeview",background=D["bg"],fieldbackground=D["bg"],foreground=D["t1"],
-                    rowheight=32,font=("Segoe UI",9),borderwidth=0)
-        s.configure("Treeview.Heading",background=D["sf"],foreground=D["t2"],
-                    font=("Segoe UI",8,"bold"),relief="flat",padding=[8,6])
-        s.map("Treeview",background=[("selected",D["rlt"])],foreground=[("selected",D["red"])])
+    def L(self, k): return self.S[self.lang].get(k, k)
 
-    def _hdr(self):
-        h=tk.Frame(self,bg=D["bg"]); h.pack(fill="x")
-        tk.Frame(h,bg=D["red"],height=3).pack(fill="x")
-        n=tk.Frame(h,bg=D["bg"]); n.pack(fill="x",padx=32,pady=14)
+    # ── Styles ─────────────────────────────────────────────────────────────
+    def _build_styles(self):
+        s = ttk.Style(self)
+        s.theme_use("clam")
+
+        s.configure("TNotebook", background=W, borderwidth=0, tabmargins=0)
+        s.configure("TNotebook.Tab", background=W, foreground=T3,
+                    padding=[22, 11], font=(FONT, 10), borderwidth=0)
+        s.map("TNotebook.Tab",
+              background=[("selected", W)],
+              foreground=[("selected", T1)])
+
+        s.configure("TFrame", background=W)
+        s.configure("G1.TFrame", background=G1)
+
+        s.configure("Red.Horizontal.TProgressbar",
+                    troughcolor=G3, background=R,
+                    borderwidth=0, thickness=3)
+
+        s.configure("Treeview",
+                    background=W, fieldbackground=W,
+                    foreground=T1, rowheight=34,
+                    font=(FONT, 9), borderwidth=0)
+        s.configure("Treeview.Heading",
+                    background=G1, foreground=T2,
+                    font=(FONT, 8, "bold"),
+                    relief="flat", padding=[10, 7])
+        s.map("Treeview",
+              background=[("selected", RL)],
+              foreground=[("selected", R)])
+
+    # ── Header ─────────────────────────────────────────────────────────────
+    def _build_header(self):
+        hdr = tk.Frame(self, bg=W)
+        hdr.pack(fill="x")
+        tk.Frame(hdr, bg=R, height=3).pack(fill="x")
+
+        nav = tk.Frame(hdr, bg=W)
+        nav.pack(fill="x", padx=32, pady=16)
+
         # Logo
-        lo=tk.Frame(n,bg=D["bg"]); lo.pack(side="left")
-        cv=tk.Canvas(lo,width=40,height=40,bg=D["bg"],highlightthickness=0); cv.pack(side="left",padx=(0,12))
-        cx,cy,r=20,20,18
-        p1=[]
-        for i in range(6): p1+=[cx+r*math.cos(math.pi/2+i*math.pi/3),cy+r*math.sin(math.pi/2+i*math.pi/3)]
-        cv.create_polygon(p1,fill=D["red"],outline="")
-        p2=[]
-        for i in range(6): p2+=[cx+11*math.cos(math.pi/2+i*math.pi/3),cy+11*math.sin(math.pi/2+i*math.pi/3)]
-        cv.create_polygon(p2,fill=D["bg"],outline="")
-        cv.create_oval(cx-5,cy-5,cx+5,cy+5,fill=D["red"],outline="")
-        tf=tk.Frame(lo,bg=D["bg"]); tf.pack(side="left")
-        tk.Label(tf,text="SILENCE",bg=D["bg"],fg=D["dark"],font=("Segoe UI",16,"bold")).pack(anchor="w")
-        tk.Label(tf,text="ECO",bg=D["bg"],fg=D["red"],font=("Segoe UI",7,"bold")).pack(anchor="w")
-        tk.Frame(n,bg=D["bd"],width=1).pack(side="left",fill="y",padx=20)
-        sf=tk.Frame(n,bg=D["bg"]); sf.pack(side="left")
-        tk.Label(sf,text="Dealer Finder",bg=D["bg"],fg=D["t1"],font=("Segoe UI",13,"bold")).pack(anchor="w")
-        tk.Label(sf,text="Extraction · Validation · Enrichissement",bg=D["bg"],fg=D["t3"],font=("Segoe UI",8)).pack(anchor="w")
-        r2=tk.Frame(n,bg=D["bg"]); r2.pack(side="right")
-        self._stlbl=tk.Label(r2,text="",bg=D["bg"],fg=D["t3"],font=("Segoe UI",9)); self._stlbl.pack(side="left",padx=(0,20))
-        for code in ("FR","ES","EN"):
-            b=tk.Button(r2,text=code,bg=D["sf"],fg=D["t2"],font=("Segoe UI",8,"bold"),
-                        relief="flat",bd=0,width=3,cursor="hand2",pady=5,
-                        activebackground=D["red"],activeforeground=D["bg"],
-                        command=lambda c=code:self._switch(c))
-            b.pack(side="left",padx=1)
-        tk.Frame(h,bg=D["bd"],height=1).pack(fill="x")
+        lo = tk.Frame(nav, bg=W)
+        lo.pack(side="left")
+        cv = tk.Canvas(lo, width=42, height=42, bg=W, highlightthickness=0)
+        cv.pack(side="left", padx=(0, 14))
+        cx, cy, r = 21, 21, 19
+        pts = sum([[cx+r*math.cos(math.pi/2+i*math.pi/3),
+                    cy+r*math.sin(math.pi/2+i*math.pi/3)] for i in range(6)], [])
+        cv.create_polygon(pts, fill=R, outline="")
+        r2 = 11
+        pts2 = sum([[cx+r2*math.cos(math.pi/2+i*math.pi/3),
+                     cy+r2*math.sin(math.pi/2+i*math.pi/3)] for i in range(6)], [])
+        cv.create_polygon(pts2, fill=W, outline="")
+        cv.create_oval(cx-5, cy-5, cx+5, cy+5, fill=R, outline="")
 
-    def _nb_build(self):
-        nb=ttk.Notebook(self); nb.pack(fill="both",expand=True); self._nb=nb
-        self._f1=ttk.Frame(nb); self._f2=ttk.Frame(nb); self._f3=ttk.Frame(nb)
-        nb.add(self._f1,text=""); nb.add(self._f2,text=""); nb.add(self._f3,text="")
-        self._t1(); self._t2(); self._t3()
+        nm = tk.Frame(lo, bg=W)
+        nm.pack(side="left")
+        tk.Label(nm, text="SILENCE", bg=W, fg=T1,
+                 font=(FONT, 17, "bold")).pack(anchor="w")
+        tk.Label(nm, text="ECO", bg=W, fg=R,
+                 font=(FONT, 7, "bold")).pack(anchor="w")
 
-    def _t1(self):
-        f=self._f1
-        self._lurll=tk.Label(f,text="",bg=D["bg"],fg=D["t2"],font=("Segoe UI",8,"bold"))
-        self._lurll.pack(anchor="w",padx=32,pady=(24,8))
-        row=tk.Frame(f,bg=D["bg"]); row.pack(fill="x",padx=32)
-        ew=tk.Frame(row,bg=D["bd"],padx=1,pady=1); ew.pack(side="left",fill="x",expand=True,padx=(0,10))
-        ei=tk.Frame(ew,bg=D["bg"]); ei.pack(fill="both")
-        self._url=tk.StringVar(value="https://www.aixam.com/fr/reseau/voiture-sans-permis-france")
-        tk.Entry(ei,textvariable=self._url,font=("Segoe UI",10),bg=D["bg"],fg=D["t1"],
-                 insertbackground=D["red"],relief="flat",bd=0,highlightthickness=0).pack(fill="x",padx=14,pady=10)
-        self._btn=tk.Button(row,text="",bg=D["red"],fg=D["bg"],font=("Segoe UI",10,"bold"),
-                             relief="flat",bd=0,cursor="hand2",padx=24,pady=11,
-                             activebackground=D["rdh"],activeforeground=D["bg"],command=self._start)
+        tk.Frame(nav, bg=G3, width=1).pack(side="left", fill="y", padx=22)
+
+        sub = tk.Frame(nav, bg=W)
+        sub.pack(side="left")
+        tk.Label(sub, text="Dealer Finder", bg=W, fg=T1,
+                 font=(FONT, 13, "bold")).pack(anchor="w")
+        tk.Label(sub, text="Extraction  ·  Validation  ·  Enrichissement",
+                 bg=W, fg=T3, font=(FONT, 8)).pack(anchor="w")
+
+        # Right
+        rt = tk.Frame(nav, bg=W)
+        rt.pack(side="right")
+        self._status_lbl = tk.Label(rt, text="", bg=W, fg=T3, font=(FONT, 9))
+        self._status_lbl.pack(side="left", padx=(0, 24))
+
+        for code in ("FR", "ES", "EN"):
+            b = tk.Button(rt, text=code,
+                          bg=G1, fg=T2,
+                          font=(FONT, 8, "bold"),
+                          relief="flat", bd=0, width=3,
+                          cursor="hand2", pady=5,
+                          activebackground=R,
+                          activeforeground=W,
+                          command=lambda c=code: self._switch(c))
+            b.pack(side="left", padx=1)
+
+        tk.Frame(hdr, bg=G3, height=1).pack(fill="x")
+
+    # ── Notebook ───────────────────────────────────────────────────────────
+    def _build_nb(self):
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True)
+        self._nb = nb
+        self._f1 = ttk.Frame(nb); self._f2 = ttk.Frame(nb); self._f3 = ttk.Frame(nb)
+        nb.add(self._f1, text=""); nb.add(self._f2, text=""); nb.add(self._f3, text="")
+        self._build_t1()
+        self._build_t2()
+        self._build_t3()
+
+    # ── Tab 1: Extraction ──────────────────────────────────────────────────
+    def _build_t1(self):
+        f = self._f1
+        P = dict(padx=32)
+
+        # URL row
+        self._lbl_url = tk.Label(f, text="", bg=W, fg=T2,
+                                  font=(FONT, 8, "bold"))
+        self._lbl_url.pack(anchor="w", padx=32, pady=(24, 8))
+
+        row = tk.Frame(f, bg=W)
+        row.pack(fill="x", **P)
+
+        # Input field — clean with bottom border only
+        ef = tk.Frame(row, bg=G2, highlightthickness=1,
+                      highlightbackground=G3, highlightcolor=R)
+        ef.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self._url = tk.StringVar(
+            value="https://www.aixam.com/fr/reseau/voiture-sans-permis-france")
+        self._url_entry = tk.Entry(
+            ef, textvariable=self._url,
+            font=(FONT, 10), bg=G2, fg=T1,
+            insertbackground=R, relief="flat", bd=0,
+            highlightthickness=0)
+        self._url_entry.pack(fill="x", padx=14, pady=10)
+
+        # Extract button
+        self._btn = tk.Button(
+            row, text="",
+            bg=R, fg=W, font=(FONT, 10, "bold"),
+            relief="flat", bd=0, cursor="hand2",
+            padx=26, pady=11,
+            activebackground=RH, activeforeground=W,
+            command=self._start)
         self._btn.pack(side="left")
-        self._pbtn=tk.Button(row,text="⏸",bg=D["sf"],fg=D["t2"],font=("Segoe UI",11),
-                              relief="flat",bd=0,cursor="hand2",padx=12,pady=11,state="disabled",
-                              activebackground=D["sf2"],command=self._pause_toggle)
-        self._pbtn.pack(side="left",padx=(6,0))
+
+        # Pause button
+        self._pause_btn = tk.Button(
+            row, text="⏸",
+            bg=G1, fg=T2, font=(FONT, 11),
+            relief="flat", bd=0, cursor="hand2",
+            padx=13, pady=11, state="disabled",
+            activebackground=AL,
+            command=self._toggle_pause)
+        self._pause_btn.pack(side="left", padx=(8, 0))
+
         # Options
-        opt=tk.Frame(f,bg=D["bg"]); opt.pack(fill="x",padx=32,pady=(12,0))
-        self._v1=tk.BooleanVar(value=True); self._v2=tk.BooleanVar(value=True); self._v3=tk.BooleanVar(value=True)
-        for v,a in [(self._v1,"_c1"),(self._v2,"_c2"),(self._v3,"_c3")]:
-            c=tk.Checkbutton(opt,text="",variable=v,bg=D["bg"],fg=D["t1"],font=("Segoe UI",9),
-                             activebackground=D["bg"],selectcolor=D["bg"],cursor="hand2",highlightthickness=0)
-            c.pack(side="left",padx=(0,22)); setattr(self,a,c)
-        # Badges row
-        br=tk.Frame(f,bg=D["bg"]); br.pack(fill="x",padx=32,pady=(10,0))
-        hb=tk.Frame(br,bg=D["glt"],padx=10,pady=4); hb.pack(side="left",padx=(0,8))
-        tk.Label(hb,text="● Hunter.io actif",bg=D["glt"],fg=D["grn"],font=("Segoe UI",8,"bold")).pack()
-        self._pbadge=tk.Frame(br,bg=D["alt"],padx=10,pady=4)
-        tk.Label(self._pbadge,text="⏸ En pause",bg=D["alt"],fg=D["amb"],font=("Segoe UI",8,"bold")).pack()
-        # Progress
-        pf=tk.Frame(f,bg=D["bg"]); pf.pack(fill="x",padx=32,pady=(16,0))
-        pr=tk.Frame(pf,bg=D["bg"]); pr.pack(fill="x",pady=(0,6))
-        self._scv=tk.Canvas(pr,width=14,height=14,bg=D["bg"],highlightthickness=0)
-        self._scv.pack(side="left",padx=(0,10)); self._scv.create_oval(2,2,12,12,fill=D["sf2"],outline="",tags="dot")
-        self._plbl=tk.Label(pr,text="",bg=D["bg"],fg=D["t1"],font=("Segoe UI",9,"bold")); self._plbl.pack(side="left")
-        self._pctlbl=tk.Label(pr,text="",bg=D["bg"],fg=D["t3"],font=("Segoe UI",9)); self._pctlbl.pack(side="right")
+        opt = tk.Frame(f, bg=W)
+        opt.pack(fill="x", **P, pady=(14, 0))
+        self._v1 = tk.BooleanVar(value=True)
+        self._v2 = tk.BooleanVar(value=True)
+        self._v3 = tk.BooleanVar(value=True)
+        for v, a in [(self._v1,"_c1"),(self._v2,"_c2"),(self._v3,"_c3")]:
+            c = tk.Checkbutton(opt, text="", variable=v,
+                               bg=W, fg=T1, font=(FONT, 9),
+                               activebackground=W, selectcolor=W,
+                               cursor="hand2", highlightthickness=0)
+            c.pack(side="left", padx=(0, 26))
+            setattr(self, a, c)
+
+        # Status pills
+        pills = tk.Frame(f, bg=W)
+        pills.pack(fill="x", **P, pady=(12, 0))
+
+        hp = tk.Frame(pills, bg=GL, padx=10, pady=5)
+        hp.pack(side="left", padx=(0, 8))
+        self._hunter_dot = tk.Canvas(hp, width=7, height=7, bg=GL,
+                                      highlightthickness=0)
+        self._hunter_dot.pack(side="left", padx=(0, 5))
+        self._hunter_dot.create_oval(0, 0, 7, 7, fill=GN, outline="")
+        tk.Label(hp, text="Hunter.io actif", bg=GL, fg=GN,
+                 font=(FONT, 8, "bold")).pack(side="left")
+
+        self._pause_pill = tk.Frame(pills, bg=AL, padx=10, pady=5)
+        tk.Label(self._pause_pill, text="⏸  En pause",
+                 bg=AL, fg=AM, font=(FONT, 8, "bold")).pack()
+
+        # Progress block
+        pg = tk.Frame(f, bg=W)
+        pg.pack(fill="x", **P, pady=(18, 0))
+
+        pgr = tk.Frame(pg, bg=W)
+        pgr.pack(fill="x", pady=(0, 8))
+
+        # Animated indicator
+        self._ind = tk.Canvas(pgr, width=10, height=10, bg=W,
+                               highlightthickness=0)
+        self._ind.pack(side="left", padx=(0, 10))
+        self._ind.create_oval(1, 1, 9, 9, fill=G2, outline="", tags="dot")
+
+        self._prog_lbl = tk.Label(pgr, text="", bg=W, fg=T1,
+                                   font=(FONT, 9, "bold"))
+        self._prog_lbl.pack(side="left")
+        self._pct_lbl = tk.Label(pgr, text="", bg=W, fg=T3,
+                                  font=(FONT, 9))
+        self._pct_lbl.pack(side="right")
+
         # Live email counter
-        self._embadge=tk.Frame(pf,bg=D["rlt"],padx=12,pady=5)
-        self._emlbl=tk.Label(self._embadge,text="0 email trouvé",bg=D["rlt"],fg=D["red"],font=("Segoe UI",9,"bold"))
-        self._emlbl.pack()
-        self._pvar=tk.DoubleVar()
-        ttk.Progressbar(pf,variable=self._pvar,maximum=100,style="P.Horizontal.TProgressbar").pack(fill="x",pady=(6,0))
+        self._em_frame = tk.Frame(pg, bg=RL, padx=12, pady=6)
+        self._em_lbl = tk.Label(self._em_frame,
+                                 text="0 emails trouvés",
+                                 bg=RL, fg=R,
+                                 font=(FONT, 8, "bold"))
+        self._em_lbl.pack()
+
+        # Annuaire.gouv check indicator
+        self._gouv_frame = tk.Frame(pg, bg=GL, padx=12, pady=6)
+        self._gouv_frame.pack(fill="x", pady=(4, 0))
+        self._gouv_frame.pack_forget()
+        tk.Label(self._gouv_frame,
+                 text="✓  Vérification annuaire-entreprises.data.gouv.fr",
+                 bg=GL, fg=GN, font=(FONT, 8)).pack()
+
+        self._prog_var = tk.DoubleVar()
+        ttk.Progressbar(pg, variable=self._prog_var, maximum=100,
+                        style="Red.Horizontal.TProgressbar").pack(
+                        fill="x", pady=(6, 0))
+
         # Log
-        lf=tk.Frame(f,bg=D["bg"]); lf.pack(fill="both",expand=True,padx=32,pady=(16,0))
-        lhr=tk.Frame(lf,bg=D["bg"]); lhr.pack(fill="x",pady=(0,6))
-        self._llbl=tk.Label(lhr,text="",bg=D["bg"],fg=D["t2"],font=("Segoe UI",8,"bold")); self._llbl.pack(side="left")
-        lw=tk.Frame(lf,bg=D["sf"],highlightthickness=1,highlightbackground=D["bd"]); lw.pack(fill="both",expand=True)
-        self._log=scrolledtext.ScrolledText(lw,height=7,font=("Segoe UI",8),bg=D["sf"],fg=D["t2"],
-                                             insertbackground=D["red"],relief="flat",bd=0,state="disabled",
-                                             wrap="word",highlightthickness=0,padx=14,pady=10)
-        self._log.pack(fill="both",expand=True)
-        self._log.tag_configure("ok",foreground=D["grn"],font=("Segoe UI",8,"bold"))
-        self._log.tag_configure("fail",foreground="#EF4444")
-        self._log.tag_configure("src",foreground="#2563EB")
-        self._log.tag_configure("hd",foreground=D["t1"],font=("Segoe UI",8,"bold"))
-        self._log.tag_configure("dim",foreground=D["t3"])
-        # Stats
-        sf3=tk.Frame(f,bg=D["bg"]); sf3.pack(fill="x",padx=32,pady=(12,24))
-        self._sv={}; self._slbl={}
-        for i,(k,vc,bc) in enumerate([("s1",D["t1"],D["sf"]),("s2",D["red"],D["rlt"]),("s3",D["grn"],D["glt"]),("s4",D["t1"],D["sf"])]):
-            c=tk.Frame(sf3,bg=bc,highlightthickness=1,highlightbackground=D["bd"],padx=16,pady=12)
-            c.pack(side="left",fill="x",expand=True,padx=(0,8) if i<3 else 0)
-            l=tk.Label(c,text="",bg=bc,fg=D["t3"],font=("Segoe UI",8)); l.pack(anchor="w")
-            v=tk.StringVar(value="—")
-            tk.Label(c,textvariable=v,bg=bc,fg=vc,font=("Segoe UI",24,"bold")).pack(anchor="w")
-            self._sv[k]=v; self._slbl[k]=l
+        lf = tk.Frame(f, bg=W)
+        lf.pack(fill="both", expand=True, **P, pady=(18, 0))
 
-    def _t2(self):
-        f=self._f2
-        top=tk.Frame(f,bg=D["bg"]); top.pack(fill="x",padx=24,pady=(14,8))
-        self._meta=tk.Label(top,text="",bg=D["bg"],fg=D["t3"],font=("Segoe UI",9)); self._meta.pack(side="left")
-        self._bcsv=tk.Button(top,text="",bg=D["red"],fg=D["bg"],font=("Segoe UI",9,"bold"),
-                              relief="flat",bd=0,cursor="hand2",padx=16,pady=6,
-                              activebackground=D["rdh"],command=self._export)
-        self._bcsv.pack(side="right")
-        self._bcpy=tk.Button(top,text="",bg=D["sf"],fg=D["t1"],font=("Segoe UI",9),
-                              relief="flat",bd=0,cursor="hand2",padx=12,pady=6,
-                              highlightthickness=1,highlightbackground=D["bd"],command=self._copy)
-        self._bcpy.pack(side="right",padx=(0,8))
-        tf=tk.Frame(f,bg=D["bg"],highlightthickness=1,highlightbackground=D["bd"])
-        tf.pack(fill="both",expand=True,padx=24,pady=(0,20))
-        self._tree=ttk.Treeview(tf,columns=("num","name","addr","phone","email","role","src"),show="headings",selectmode="browse")
-        for col,w in [("num",36),("name",190),("addr",145),("phone",95),("email",182),("role",140),("src",88)]:
-            self._tree.column(col,width=w,minwidth=28)
-        vsb=ttk.Scrollbar(tf,orient="vertical",command=self._tree.yview)
-        hsb=ttk.Scrollbar(tf,orient="horizontal",command=self._tree.xview)
-        self._tree.configure(yscrollcommand=vsb.set,xscrollcommand=hsb.set)
-        vsb.pack(side="right",fill="y"); hsb.pack(side="bottom",fill="x"); self._tree.pack(fill="both",expand=True)
-        self._tree.tag_configure("miss",background="#FFF5F5")
-        self._tree.tag_configure("web",background="#FFFBEB")
-        self._tree.tag_configure("hunter",background="#F0FDF4")
+        lh = tk.Frame(lf, bg=W)
+        lh.pack(fill="x", pady=(0, 6))
+        self._log_hdr = tk.Label(lh, text="", bg=W, fg=T2,
+                                  font=(FONT, 8, "bold"))
+        self._log_hdr.pack(side="left")
 
-    def _t3(self):
-        f=self._f3
-        cv=tk.Canvas(f,bg=D["bg"],highlightthickness=0)
-        sb=ttk.Scrollbar(f,orient="vertical",command=cv.yview)
-        cv.configure(yscrollcommand=sb.set); sb.pack(side="right",fill="y"); cv.pack(fill="both",expand=True)
-        inner=tk.Frame(cv,bg=D["bg"]); win=cv.create_window((0,0),window=inner,anchor="nw")
-        def _r(e): cv.configure(scrollregion=cv.bbox("all")); cv.itemconfig(win,width=e.width)
-        cv.bind("<Configure>",_r)
-        def sec(t):
-            fr=tk.Frame(inner,bg=D["bg"]); fr.pack(fill="x",padx=32,pady=(24,0))
-            tk.Label(fr,text=t,bg=D["bg"],fg=D["t1"],font=("Segoe UI",10,"bold")).pack(anchor="w")
-            tk.Frame(fr,bg=D["bd"],height=1).pack(fill="x",pady=(8,12)); return fr
-        def spn(p,k,v,fr,to,step=1):
-            r=tk.Frame(p,bg=D["bg"]); r.pack(fill="x",padx=4,pady=5)
-            tk.Label(r,text=self.L(k),bg=D["bg"],fg=D["t1"],font=("Segoe UI",9)).pack(side="left")
-            sw=tk.Frame(r,bg=D["bd"],padx=1,pady=1); sw.pack(side="right")
-            tk.Spinbox(sw,textvariable=v,from_=fr,to=to,increment=step,width=6,
-                       font=("Segoe UI",9),bg=D["bg"],fg=D["t1"],relief="flat",bd=0,
-                       insertbackground=D["red"],highlightthickness=0).pack(ipady=5,padx=6)
-        s1=sec("Réseau")
-        spn(s1,"p_delay",self.delay,0.3,10,0.1); spn(s1,"p_timeout",self.timeout,5,60); spn(s1,"p_retries",self.retries,1,6)
-        s2=sec("Filtres")
-        tk.Label(s2,text=self.L("p_excl"),bg=D["bg"],fg=D["t1"],font=("Segoe UI",9)).pack(anchor="w",padx=4)
-        tk.Label(s2,text=self.L("p_excl_desc"),bg=D["bg"],fg=D["t3"],font=("Segoe UI",8)).pack(anchor="w",padx=4,pady=(2,6))
-        tw=tk.Frame(s2,bg=D["bd"],padx=1,pady=1); tw.pack(fill="x",padx=4,pady=(0,4))
-        self._extxt=tk.Text(tw,height=8,font=("Segoe UI",8),bg=D["bg"],fg=D["t1"],
-                             insertbackground=D["red"],relief="flat",bd=0,highlightthickness=0,padx=10,pady=8)
-        self._extxt.pack(fill="x"); self._extxt.insert("1.0","\n".join(self.excl))
-        s3=sec("Export")
-        self._ckno=tk.Checkbutton(s3,text=self.L("p_include_no_email"),variable=self.inc_no,
-                                   bg=D["bg"],fg=D["t1"],font=("Segoe UI",9),
-                                   activebackground=D["bg"],selectcolor=D["bg"],cursor="hand2")
-        self._ckno.pack(anchor="w",padx=4,pady=2)
-        self._ckop=tk.Checkbutton(s3,text=self.L("p_open_csv"),variable=self.open_csv,
-                                   bg=D["bg"],fg=D["t1"],font=("Segoe UI",9),
-                                   activebackground=D["bg"],selectcolor=D["bg"],cursor="hand2")
-        self._ckop.pack(anchor="w",padx=4,pady=2)
-        br=tk.Frame(inner,bg=D["bg"]); br.pack(fill="x",padx=32,pady=20)
-        self._bsave=tk.Button(br,text="",bg=D["red"],fg=D["bg"],font=("Segoe UI",9,"bold"),
-                               relief="flat",bd=0,cursor="hand2",padx=16,pady=8,
-                               activebackground=D["rdh"],command=self._save)
-        self._bsave.pack(side="left")
-        self._brst=tk.Button(br,text="",bg=D["sf"],fg=D["t2"],font=("Segoe UI",9),
-                              relief="flat",bd=0,cursor="hand2",padx=12,pady=8,
-                              highlightthickness=1,highlightbackground=D["bd"],command=self._reset)
-        self._brst.pack(side="left",padx=(8,0))
+        lw = tk.Frame(lf, bg=G1, highlightthickness=1,
+                      highlightbackground=G3)
+        lw.pack(fill="both", expand=True)
+        self._log = scrolledtext.ScrolledText(
+            lw, height=7, font=(FONT_MONO, 8),
+            bg=G1, fg=T2, insertbackground=R,
+            relief="flat", bd=0, state="disabled",
+            wrap="word", highlightthickness=0,
+            padx=16, pady=10)
+        self._log.pack(fill="both", expand=True)
 
-    def _switch(self,lang): self.lang=lang; self._apply_lang()
+        # Log colors
+        self._log.tag_configure("ok",   foreground=GN, font=(FONT_MONO, 8, "bold"))
+        self._log.tag_configure("fail", foreground="#DC2626")
+        self._log.tag_configure("info", foreground="#2563EB")
+        self._log.tag_configure("head", foreground=T1, font=(FONT_MONO, 8, "bold"))
+        self._log.tag_configure("dim",  foreground=T3)
+
+        # Stats cards
+        sf = tk.Frame(f, bg=W)
+        sf.pack(fill="x", **P, pady=(14, 26))
+        self._sv = {}; self._slbl = {}
+        cards = [
+            ("s1", T1, W,   G3),
+            ("s2", R,  RL,  R),
+            ("s3", GN, GL,  GN),
+            ("s4", T1, W,   G3),
+        ]
+        for i, (k, vc, bg, ac) in enumerate(cards):
+            card = tk.Frame(sf, bg=bg,
+                            highlightthickness=1,
+                            highlightbackground=ac if k == "s2" else G3,
+                            padx=18, pady=14)
+            card.pack(side="left", fill="x", expand=True,
+                      padx=(0, 10) if i < 3 else 0)
+            lbl = tk.Label(card, text="", bg=bg, fg=T3,
+                           font=(FONT, 8))
+            lbl.pack(anchor="w")
+            v = tk.StringVar(value="—")
+            tk.Label(card, textvariable=v, bg=bg, fg=vc,
+                     font=(FONT, 26, "bold")).pack(anchor="w")
+            self._sv[k] = v; self._slbl[k] = lbl
+
+    # ── Tab 2: Results ─────────────────────────────────────────────────────
+    def _build_t2(self):
+        f = self._f2
+
+        top = tk.Frame(f, bg=W)
+        top.pack(fill="x", padx=24, pady=(16, 8))
+        self._meta = tk.Label(top, text="", bg=W, fg=T3, font=(FONT, 9))
+        self._meta.pack(side="left")
+
+        self._btn_csv = tk.Button(top, text="",
+                                   bg=R, fg=W, font=(FONT, 9, "bold"),
+                                   relief="flat", bd=0, cursor="hand2",
+                                   padx=18, pady=7,
+                                   activebackground=RH,
+                                   command=self._export)
+        self._btn_csv.pack(side="right")
+
+        self._btn_copy = tk.Button(top, text="",
+                                    bg=W, fg=T1, font=(FONT, 9),
+                                    relief="flat", bd=0, cursor="hand2",
+                                    padx=14, pady=7,
+                                    highlightthickness=1,
+                                    highlightbackground=G3,
+                                    command=self._copy)
+        self._btn_copy.pack(side="right", padx=(0, 10))
+
+        # Table
+        tw = tk.Frame(f, bg=W, highlightthickness=1,
+                      highlightbackground=G3)
+        tw.pack(fill="both", expand=True, padx=24, pady=(0, 24))
+
+        cols = ("num","name","addr","phone","email","role","src")
+        self._tree = ttk.Treeview(tw, columns=cols,
+                                   show="headings", selectmode="browse")
+        for col, w in [("num",38),("name",195),("addr",148),
+                       ("phone",98),("email",185),("role",142),("src",90)]:
+            self._tree.column(col, width=w, minwidth=28)
+
+        vsb = ttk.Scrollbar(tw, orient="vertical",
+                             command=self._tree.yview)
+        hsb = ttk.Scrollbar(tw, orient="horizontal",
+                             command=self._tree.xview)
+        self._tree.configure(yscrollcommand=vsb.set,
+                             xscrollcommand=hsb.set)
+        vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
+        self._tree.pack(fill="both", expand=True)
+
+        self._tree.tag_configure("miss",   background="#FFF5F5")
+        self._tree.tag_configure("web",    background="#FFFBEB")
+        self._tree.tag_configure("hunter", background="#F0FDF4")
+
+    # ── Tab 3: Settings ────────────────────────────────────────────────────
+    def _build_t3(self):
+        f = self._f3
+        cv = tk.Canvas(f, bg=W, highlightthickness=0)
+        sb = ttk.Scrollbar(f, orient="vertical", command=cv.yview)
+        cv.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        cv.pack(fill="both", expand=True)
+        inner = tk.Frame(cv, bg=W)
+        win = cv.create_window((0, 0), window=inner, anchor="nw")
+        def _r(e):
+            cv.configure(scrollregion=cv.bbox("all"))
+            cv.itemconfig(win, width=e.width)
+        cv.bind("<Configure>", _r)
+
+        def sec(title, subtitle=""):
+            fr = tk.Frame(inner, bg=W)
+            fr.pack(fill="x", padx=32, pady=(28, 0))
+            tk.Label(fr, text=title, bg=W, fg=T1,
+                     font=(FONT, 10, "bold")).pack(anchor="w")
+            if subtitle:
+                tk.Label(fr, text=subtitle, bg=W, fg=T3,
+                         font=(FONT, 8)).pack(anchor="w", pady=(2, 0))
+            tk.Frame(fr, bg=G3, height=1).pack(fill="x", pady=(8, 14))
+            return fr
+
+        def spin_row(parent, label, hint, var, frm, to, step=1):
+            r = tk.Frame(parent, bg=W)
+            r.pack(fill="x", padx=4, pady=6)
+            lf = tk.Frame(r, bg=W)
+            lf.pack(side="left", fill="x", expand=True)
+            tk.Label(lf, text=label, bg=W, fg=T1,
+                     font=(FONT, 9)).pack(anchor="w")
+            if hint:
+                tk.Label(lf, text=hint, bg=W, fg=T3,
+                         font=(FONT, 8)).pack(anchor="w")
+            sw = tk.Frame(r, bg=G3, padx=1, pady=1)
+            sw.pack(side="right")
+            sp = tk.Spinbox(sw, textvariable=var,
+                            from_=frm, to=to, increment=step,
+                            width=7, font=(FONT, 9),
+                            bg=G2, fg=T1, relief="flat", bd=0,
+                            insertbackground=R, highlightthickness=0)
+            sp.pack(ipady=6, padx=6)
+
+        s1 = sec("Recherche",
+                 "Paramètres de vitesse et de robustesse de l'extraction")
+        spin_row(s1, "Délai entre requêtes (s)",
+                 "Augmenter si le site bloque (recommandé: 0.8–2s)",
+                 self.delay, 0.3, 10, 0.1)
+        spin_row(s1, "Timeout connexion (s)",
+                 "Temps max d'attente par page (recommandé: 15–25s)",
+                 self.timeout_v, 5, 60, 1)
+        spin_row(s1, "Tentatives en cas d'erreur",
+                 "Nombre de réessais si une page ne répond pas",
+                 self.retries_v, 1, 6, 1)
+
+        s2 = sec("Filtres",
+                 "Domaines à ignorer lors de la recherche d'emails")
+        tk.Label(s2, text=self.L("p_excl"), bg=W, fg=T1,
+                 font=(FONT, 9)).pack(anchor="w", padx=4)
+        tk.Label(s2, text=self.L("p_excl_desc"), bg=W, fg=T3,
+                 font=(FONT, 8)).pack(anchor="w", padx=4, pady=(2, 8))
+        tw2 = tk.Frame(s2, bg=G3, padx=1, pady=1)
+        tw2.pack(fill="x", padx=4)
+        self._excl_txt = tk.Text(tw2, height=8,
+                                  font=(FONT_MONO, 8),
+                                  bg=G2, fg=T1, insertbackground=R,
+                                  relief="flat", bd=0,
+                                  highlightthickness=0,
+                                  padx=12, pady=8)
+        self._excl_txt.pack(fill="x")
+        self._excl_txt.insert("1.0", "\n".join(self.excl))
+
+        s3 = sec("Export")
+        self._ck_no = tk.Checkbutton(s3,
+            text=self.L("p_include_no_email"),
+            variable=self.inc_no,
+            bg=W, fg=T1, font=(FONT, 9),
+            activebackground=W, selectcolor=W, cursor="hand2")
+        self._ck_no.pack(anchor="w", padx=4, pady=2)
+        self._ck_open = tk.Checkbutton(s3,
+            text=self.L("p_open_csv"),
+            variable=self.open_csv,
+            bg=W, fg=T1, font=(FONT, 9),
+            activebackground=W, selectcolor=W, cursor="hand2")
+        self._ck_open.pack(anchor="w", padx=4, pady=2)
+
+        br = tk.Frame(inner, bg=W)
+        br.pack(fill="x", padx=32, pady=22)
+        self._btn_save = tk.Button(br, text="",
+            bg=R, fg=W, font=(FONT, 9, "bold"),
+            relief="flat", bd=0, cursor="hand2",
+            padx=18, pady=9,
+            activebackground=RH, command=self._save)
+        self._btn_save.pack(side="left")
+        self._btn_rst = tk.Button(br, text="",
+            bg=W, fg=T2, font=(FONT, 9),
+            relief="flat", bd=0, cursor="hand2",
+            padx=14, pady=9,
+            highlightthickness=1, highlightbackground=G3,
+            command=self._reset)
+        self._btn_rst.pack(side="left", padx=(10, 0))
+
+    # ── Language ───────────────────────────────────────────────────────────
+    def _switch(self, lang): self.lang = lang; self._apply_lang()
 
     def _apply_lang(self):
-        L=self.L; self.title(L("title"))
-        self._nb.tab(0,text=f"  {L('tab1')}  ")
-        self._nb.tab(1,text=f"  {L('tab2')}  ")
-        self._nb.tab(2,text=f"  {L('tab3')}  ")
-        self._lurll.configure(text=L("url_label"))
-        self._btn.configure(text=L("btn_go") if not self._run else L("btn_run"))
-        self._c1.configure(text=L("opt1")); self._c2.configure(text=L("opt2")); self._c3.configure(text=L("opt3"))
-        self._llbl.configure(text=L("log_lbl"))
-        for k,tk_k in [("s1","stat1"),("s2","stat2"),("s3","stat3"),("s4","stat4")]:
+        L = self.L
+        self.title(L("title"))
+        self._nb.tab(0, text=f"  {L('tab1')}  ")
+        self._nb.tab(1, text=f"  {L('tab2')}  ")
+        self._nb.tab(2, text=f"  {L('tab3')}  ")
+        self._lbl_url.configure(text=L("url_label"))
+        self._btn.configure(
+            text=L("btn_run") if (self._run and not self._paused)
+            else L("btn_go") if not self._run else L("btn_again"))
+        self._c1.configure(text=L("opt1"))
+        self._c2.configure(text=L("opt2"))
+        self._c3.configure(text=L("opt3"))
+        self._log_hdr.configure(text=L("log_lbl"))
+        for k, tk_k in [("s1","stat1"),("s2","stat2"),
+                         ("s3","stat3"),("s4","stat4")]:
             self._slbl[k].configure(text=L(tk_k))
-        rl={"FR":"Rôle","ES":"Rol","EN":"Role"}.get(self.lang,"Rôle")
-        for col,key in [("num","col_num"),("name","col_name"),("addr","col_addr"),
-                        ("phone","col_phone"),("email","col_email"),("src","col_src")]:
-            self._tree.heading(col,text=L(key))
-        self._tree.heading("role",text=rl)
-        self._bcpy.configure(text=L("btn_copy")); self._bcsv.configure(text=L("btn_csv"))
-        self._bsave.configure(text=L("btn_save")); self._brst.configure(text=L("btn_reset"))
-        self._ckno.configure(text=L("p_include_no_email")); self._ckop.configure(text=L("p_open_csv"))
-        self._stlbl.configure(text=L("ready"))
+        rl = {"FR":"Rôle","ES":"Rol","EN":"Role"}.get(self.lang, "Rôle")
+        for col, key in [("num","col_num"),("name","col_name"),
+                         ("addr","col_addr"),("phone","col_phone"),
+                         ("email","col_email"),("src","col_src")]:
+            self._tree.heading(col, text=L(key))
+        self._tree.heading("role", text=rl)
+        self._btn_copy.configure(text=L("btn_copy"))
+        self._btn_csv.configure(text=L("btn_csv"))
+        self._btn_save.configure(text=L("btn_save"))
+        self._btn_rst.configure(text=L("btn_reset"))
+        self._ck_no.configure(text=L("p_include_no_email"))
+        self._ck_open.configure(text=L("p_open_csv"))
+        self._status_lbl.configure(text=L("ready"))
         if self.results: self._render()
 
-    def _anim_start(self):
-        self._tick=0; self._embadge.pack(fill="x",pady=(6,0)); self._anim_loop()
+    # ── Animation ──────────────────────────────────────────────────────────
+    def _start_anim(self):
+        self._tick = 0
+        self._em_frame.pack(fill="x", pady=(6, 0))
+        self._anim_loop()
 
-    def _anim_stop(self):
-        if self._aid: self.after_cancel(self._aid); self._aid=None
-        try: self._scv.itemconfig("dot",fill=D["grn"]); self._embadge.pack_forget()
-        except: pass
+    def _stop_anim(self):
+        if self._anim_id:
+            self.after_cancel(self._anim_id)
+            self._anim_id = None
+        try:
+            self._ind.itemconfig("dot", fill=GN)
+            self._em_frame.pack_forget()
+        except Exception:
+            pass
 
     def _anim_loop(self):
         if not self._run: return
-        self._tick+=1
-        t=self._tick*0.25; i=int(128+127*math.sin(t))
-        color=D["amb"] if self._paused else f"#{max(i,50):02x}0011"
-        try:
-            self._scv.itemconfig("dot",fill=color)
-            c=sum(len(d.get("emails",{})) for d in self.results)
-            self._emlbl.configure(text=f"{c} email{'s' if c!=1 else ''} trouvé{'s' if c!=1 else ''}")
-        except: pass
-        self._aid=self.after(60,self._anim_loop)
-
-    def _pause_toggle(self):
-        if not self._run: return
-        self._paused=not self._paused
+        self._tick += 1
+        t = self._tick * 0.22
+        v = int(60 + 45 * math.sin(t))
         if self._paused:
-            self._pev.clear(); self._pbtn.configure(text="▶",bg=D["alt"],fg=D["amb"])
-            self._pbadge.pack(side="left"); self._plbl.configure(text="En pause…")
-            self._log_add("⏸ En pause — cliquez ▶ pour reprendre","hd")
+            fill = AM
         else:
-            self._pev.set(); self._pbtn.configure(text="⏸",bg=D["sf"],fg=D["t2"])
-            self._pbadge.pack_forget(); self._log_add("▶ Reprise…","ok")
+            fill = f"#{232:02x}{v:02x}{44:02x}"
+        try:
+            self._ind.itemconfig("dot", fill=fill)
+            count = sum(len(d.get("emails", {})) for d in self.results)
+            self._em_lbl.configure(
+                text=f"{count} email{'s' if count!=1 else ''} trouvé{'s' if count!=1 else ''}")
+        except Exception:
+            pass
+        self._anim_id = self.after(70, self._anim_loop)
 
-    def _log_add(self,msg,force=None):
+    # ── Pause ──────────────────────────────────────────────────────────────
+    def _toggle_pause(self):
+        if not self._run: return
+        self._paused = not self._paused
+        if self._paused:
+            self._pause_ev.clear()
+            self._pause_btn.configure(text="▶", bg=AL, fg=AM)
+            self._pause_pill.pack(side="left")
+            self._prog_lbl.configure(text="En pause…")
+            self._log_add("⏸  Extraction en pause — cliquez ▶ pour reprendre", "head")
+        else:
+            self._pause_ev.set()
+            self._pause_btn.configure(text="⏸", bg=G1, fg=T2)
+            self._pause_pill.pack_forget()
+            self._log_add("▶  Reprise de l'extraction…", "ok")
+
+    # ── Log ────────────────────────────────────────────────────────────────
+    def _log_add(self, msg, force_tag=None):
         self._log.configure(state="normal")
-        if force: tag=force
-        elif any(x in msg for x in ("✅","✔","✓","━━")): tag="ok"
-        elif any(x in msg for x in ("✗","ERREUR","rejeté","⚠")): tag="fail"
-        elif any(x in msg for x in ("🔍","🗺","💡","Hunter","1/3","2/3","3/3","Site")): tag="src"
-        elif msg.startswith(("┌","└","━")): tag="hd"
-        else: tag="dim"
-        self._log.insert("end",f"{msg}\n",tag); self._log.see("end"); self._log.configure(state="disabled")
+        if force_tag:
+            tag = force_tag
+        elif any(x in msg for x in ("✅","✔","✓","━━","email(s)")):
+            tag = "ok"
+        elif any(x in msg for x in ("✗","ERREUR","rejeté","⚠")):
+            tag = "fail"
+        elif any(x in msg for x in ("🔍","🗺","💡","Hunter","1/3","2/3","3/3","gouv")):
+            tag = "info"
+        elif msg.startswith(("┌","└","━","─")):
+            tag = "head"
+        else:
+            tag = "dim"
+        self._log.insert("end", f"{msg}\n", tag)
+        self._log.see("end")
+        self._log.configure(state="disabled")
 
-    def _set_prog(self,pct,lbl=""):
-        self._pvar.set(pct)
-        if lbl: self._plbl.configure(text=lbl); self._pctlbl.configure(text=f"{int(pct)}%" if pct else "")
+    def _set_prog(self, pct, lbl=""):
+        self._prog_var.set(pct)
+        if lbl:
+            self._prog_lbl.configure(text=lbl)
+            self._pct_lbl.configure(text=f"{int(pct)}%" if pct else "")
         self.update_idletasks()
 
+    # ── Save / Reset ───────────────────────────────────────────────────────
     def _save(self):
-        self.excl=[l.strip().lstrip("@") for l in self._extxt.get("1.0","end").strip().splitlines() if l.strip()]
-        messagebox.showinfo("Silence",self.L("info_saved"))
+        raw = self._excl_txt.get("1.0", "end").strip()
+        self.excl = [l.strip().lstrip("@")
+                     for l in raw.splitlines() if l.strip()]
+        messagebox.showinfo("Silence", self.L("info_saved"))
 
     def _reset(self):
-        self.excl=list(EXCL_DEFAULT); self._extxt.delete("1.0","end"); self._extxt.insert("1.0","\n".join(self.excl))
-        self.delay.set(0.8); self.timeout.set(18); self.retries.set(3); self.inc_no.set(True); self.open_csv.set(False)
-        messagebox.showinfo("Silence",self.L("info_reset"))
+        # EXCL_DEFAULT available in scope
+        self.excl = list(EXCL_DEFAULT)
+        self._excl_txt.delete("1.0", "end")
+        self._excl_txt.insert("1.0", "\n".join(self.excl))
+        self.delay.set(0.8); self.timeout_v.set(18)
+        self.retries_v.set(3); self.inc_no.set(True)
+        self.open_csv.set(False)
+        messagebox.showinfo("Silence", self.L("info_reset"))
 
+    # ── Start / Worker ─────────────────────────────────────────────────────
     def _start(self):
         if self._run:
-            if self._paused: self._pause_toggle()
+            if self._paused: self._toggle_pause()
             return
-        url=self._url.get().strip()
-        if not url.startswith("http"): messagebox.showerror("",self.L("err_url")); return
-        self._run=True; self._paused=False; self._pev.set()
-        self._btn.configure(state="disabled",text=self.L("btn_run")); self._pbtn.configure(state="normal")
-        self._log.configure(state="normal"); self._log.delete("1.0","end"); self._log.configure(state="disabled")
-        self._set_prog(0,"Démarrage…"); self._pctlbl.configure(text="")
+        url = self._url.get().strip()
+        if not url.startswith("http"):
+            messagebox.showerror("", self.L("err_url")); return
+        self._run = True; self._paused = False; self._pause_ev.set()
+        self._btn.configure(state="disabled", text=self.L("btn_run"))
+        self._pause_btn.configure(state="normal")
+        self._log.configure(state="normal")
+        self._log.delete("1.0", "end")
+        self._log.configure(state="disabled")
+        self._set_prog(0, "Démarrage…")
+        self._pct_lbl.configure(text="")
         for v in self._sv.values(): v.set("—")
-        self._anim_start()
-        excl=self.excl if self._v3.get() else []
-        threading.Thread(target=self._worker,args=(url,excl),daemon=True).start()
+        self._gouv_frame.pack_forget()
+        self._start_anim()
+        excl = self.excl if self._v3.get() else []
+        threading.Thread(target=self._worker, args=(url, excl),
+                         daemon=True).start()
 
-    def _worker(self,url,excl):
+    def _worker(self, url, excl):
         try:
-            to=self.timeout.get(); rt=self.retries.get(); dly=self.delay.get()
-            dealers=scrape_page(url,excl,self._log_add,self._set_prog,timeout=to,retries=rt)
-            self._set_prog(44,"Enrichissement…")
+            to = self.timeout_v.get()
+            rt = self.retries_v.get()
+            dly = self.delay.get()
+
+            dealers = self._SP(url, excl, self._log_add,
+                               self._set_prog, timeout=to, retries=rt)
+            self._set_prog(44, "Enrichissement des emails…")
+
             if self._v1.get():
-                no_em=sum(1 for d in dealers if not d["emails"]); has_em=len(dealers)-no_em
-                self._log_add(f"━━ {len(dealers)} concessionnaires · {has_em} avec email · {no_em} à enrichir ━━","hd")
-                lock=threading.Lock(); done=[0]
+                no_em  = sum(1 for d in dealers if not d["emails"])
+                has_em = len(dealers) - no_em
+                self._log_add(
+                    f"━━  {len(dealers)} concessionnaires  ·  "
+                    f"{has_em} avec email  ·  {no_em} à enrichir  ━━", "head")
+
+                # Show gouv indicator
+                self.after(0, self._gouv_frame.pack,
+                           {"fill":"x","pady":(4,0)})
+
+                lock = threading.Lock()
+                done = [0]
+
                 def do_one(d):
-                    self._pev.wait()
+                    self._pause_ev.wait()
                     try:
-                        em,src=enrich(d,excl,self._log_add,delay=dly,timeout=to)
-                        if em: d["emails"]=em; d["src"]=src
+                        em, src = self._ED(d, excl, self._log_add,
+                                           delay=dly, timeout=to)
+                        if em: d["emails"] = em; d["src"] = src
                     except Exception as e:
-                        self._log_add(f"  ⚠ {d['name'][:30]}: {e}")
+                        self._log_add(f"  ⚠  {d['name'][:30]}: {e}")
                     finally:
                         with lock:
-                            done[0]+=1; pct=44+int(50*done[0]/max(len(dealers),1))
-                            self._set_prog(pct,f"{done[0]}/{len(dealers)} — {d['name'][:30]}")
-                threads=[]
+                            done[0] += 1
+                            pct = 44 + int(50 * done[0] /
+                                           max(len(dealers), 1))
+                            self._set_prog(
+                                pct,
+                                f"{done[0]}/{len(dealers)}"
+                                f"  —  {d['name'][:32]}")
+
+                threads = []
                 for d in dealers:
-                    self._pev.wait()
-                    t=threading.Thread(target=do_one,args=(d,),daemon=True)
+                    self._pause_ev.wait()
+                    t = threading.Thread(target=do_one, args=(d,),
+                                         daemon=True)
                     threads.append(t); t.start()
-                    while len([x for x in threads if x.is_alive()])>=4: time.sleep(0.3)
+                    while sum(1 for x in threads if x.is_alive()) >= 4:
+                        time.sleep(0.3)
                 for t in threads: t.join(timeout=40)
+
             if self._v2.get():
-                seen,uniq=set(),[]
+                seen, uniq = set(), []
                 for d in dealers:
-                    k=re.sub(r"[^a-z0-9]","",d["name"].lower())[:20]
+                    k = self._NRM(d["name"])[:20]
                     if k not in seen: seen.add(k); uniq.append(d)
-                dealers=uniq
-            total=sum(len(d["emails"]) for d in dealers)
-            self._set_prog(100,"Terminé ✓")
-            self._log_add(f"━━ {len(dealers)} concessionnaires · {total} emails validés ━━","hd")
-            self.results=dealers; self.after(0,self._finish)
+                dealers = uniq
+
+            total = sum(len(d["emails"]) for d in dealers)
+            self._set_prog(100, "Extraction terminée ✓")
+            self._log_add(
+                f"━━  {len(dealers)} concessionnaires  ·  "
+                f"{total} emails validés  ━━", "head")
+            self.results = dealers
+            self.after(0, self._finish)
+
         except Exception as e:
-            self.after(0,lambda:messagebox.showerror("Erreur",str(e)))
-            self._log_add(f"✗ Erreur : {e}","fail")
-            self.after(0,lambda:(self._btn.configure(state="normal",text=self.L("btn_go")),self._pbtn.configure(state="disabled")))
-            self._run=False; self._anim_stop()
+            self.after(0, lambda: messagebox.showerror("Erreur", str(e)))
+            self._log_add(f"✗  Erreur critique : {e}", "fail")
+            self.after(0, lambda: (
+                self._btn.configure(state="normal",
+                                    text=self.L("btn_go")),
+                self._pause_btn.configure(state="disabled")
+            ))
+            self._run = False
+            self._stop_anim()
 
     def _finish(self):
-        self._run=False; self._paused=False; self._anim_stop()
-        self._pbtn.configure(state="disabled",text="⏸",bg=D["sf"],fg=D["t2"]); self._pbadge.pack_forget()
-        d=self.results; em=sum(len(x["emails"]) for x in d); wb=sum(1 for x in d if x["src"] in ("web","hunter")); ad=sum(1 for x in d if x["addr"])
-        self._sv["s1"].set(str(len(d))); self._sv["s2"].set(str(em)); self._sv["s3"].set(str(wb)); self._sv["s4"].set(str(ad))
-        self._btn.configure(state="normal",text=self.L("btn_again"))
-        self._stlbl.configure(text=self.L("last")+datetime.now().strftime("%H:%M"))
-        self._render(); self._nb.select(self._f2)
+        self._run = False; self._paused = False
+        self._stop_anim()
+        self._pause_btn.configure(state="disabled", text="⏸",
+                                   bg=G1, fg=T2)
+        self._pause_pill.pack_forget()
+        d = self.results
+        em = sum(len(x["emails"]) for x in d)
+        wb = sum(1 for x in d if x["src"] in ("web","hunter"))
+        ad = sum(1 for x in d if x["addr"])
+        self._sv["s1"].set(str(len(d))); self._sv["s2"].set(str(em))
+        self._sv["s3"].set(str(wb));     self._sv["s4"].set(str(ad))
+        self._btn.configure(state="normal", text=self.L("btn_again"))
+        self._status_lbl.configure(
+            text=self.L("last") + datetime.now().strftime("%H:%M"))
+        self._render()
+        self._nb.select(self._f2)
 
     def _render(self):
-        d=self.results; em=sum(len(x["emails"]) for x in d); ad=sum(1 for x in d if x["addr"])
-        sm={"page":self.L("src_page"),"web":self.L("src_web"),"hunter":self.L("src_hunter")}
-        self._meta.configure(text=f"{len(d)} {self.L('stat1')} · {em} {self.L('stat2')} · {ad} {self.L('stat4')}")
-        for r in self._tree.get_children(): self._tree.delete(r)
-        n=1
+        d = self.results
+        em = sum(len(x["emails"]) for x in d)
+        ad = sum(1 for x in d if x["addr"])
+        sm = {"page": self.L("src_page"),
+              "web":  self.L("src_web"),
+              "hunter": self.L("src_hunter")}
+        self._meta.configure(
+            text=f"{len(d)} {self.L('stat1')}  ·  "
+                 f"{em} {self.L('stat2')}  ·  "
+                 f"{ad} {self.L('stat4')}")
+        for r in self._tree.get_children():
+            self._tree.delete(r)
+        n = 1
         for x in d:
-            sl=sm.get(x["src"],"—")
+            sl = sm.get(x["src"], "—")
             if not x["emails"]:
-                self._tree.insert("","end",tags=("miss",),values=(n,x["name"],x["addr"],x["phone"],"—","—",sl)); n+=1
+                self._tree.insert("", "end", tags=("miss",), values=(
+                    n, x["name"], x["addr"], x["phone"], "—", "—", sl))
+                n += 1
             else:
-                for i,(email,role) in enumerate(sorted(x["emails"].items())):
-                    tag={"page":"","web":"web","hunter":"hunter"}.get(x["src"],"")
-                    self._tree.insert("","end",tags=(tag,),values=(n if i==0 else "",x["name"] if i==0 else "",x["addr"] if i==0 else "",x["phone"] if i==0 else "",email,role,sl if i==0 else ""))
-                n+=1
+                for i, (email, role) in enumerate(
+                        sorted(x["emails"].items())):
+                    tag = {"page":"","web":"web",
+                           "hunter":"hunter"}.get(x["src"], "")
+                    self._tree.insert("", "end", tags=(tag,), values=(
+                        n  if i==0 else "",
+                        x["name"]  if i==0 else "",
+                        x["addr"]  if i==0 else "",
+                        x["phone"] if i==0 else "",
+                        email, role,
+                        sl if i==0 else ""))
+                n += 1
 
     def _copy(self):
-        em=sorted({e for x in self.results for e in x["emails"]})
-        if not em: messagebox.showinfo("",self.L("no_copy")); return
-        self.clipboard_clear(); self.clipboard_append("\n".join(em))
-        messagebox.showinfo("✓",f"{len(em)} {self.L('copied')}")
+        em = sorted({e for x in self.results for e in x["emails"]})
+        if not em:
+            messagebox.showinfo("", self.L("no_copy")); return
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(em))
+        messagebox.showinfo("✓", f"{len(em)} {self.L('copied')}")
 
     def _export(self):
-        if not self.results: messagebox.showinfo("",self.L("no_copy")); return
-        desk=os.path.join(os.path.expanduser("~"),"Desktop"); os.makedirs(desk,exist_ok=True)
-        fname=f"silence_dealers_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.csv"; fpath=os.path.join(desk,fname)
-        sm={"page":self.L("src_page"),"web":self.L("src_web"),"hunter":self.L("src_hunter")}
-        date_s=datetime.now().strftime("%d/%m/%Y"); rows=0
-        with open(fpath,"w",newline="",encoding="utf-8-sig") as fp:
-            w=csv.writer(fp)
-            w.writerow([self.L("col_name"),self.L("col_addr"),self.L("col_phone"),self.L("col_email"),self.L("col_role"),"Site web",self.L("col_src"),"Date"])
+        if not self.results:
+            messagebox.showinfo("", self.L("no_copy")); return
+        desk = os.path.join(os.path.expanduser("~"), "Desktop")
+        os.makedirs(desk, exist_ok=True)
+        fname = f"silence_dealers_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.csv"
+        fpath = os.path.join(desk, fname)
+        sm = {"page": self.L("src_page"),
+              "web":  self.L("src_web"),
+              "hunter": self.L("src_hunter")}
+        date_s = datetime.now().strftime("%d/%m/%Y"); rows = 0
+        with open(fpath, "w", newline="", encoding="utf-8-sig") as fp:
+            w = csv.writer(fp)
+            w.writerow([self.L("col_name"), self.L("col_addr"),
+                        self.L("col_phone"), self.L("col_email"),
+                        self.L("col_role"), "Site web",
+                        self.L("col_src"), "Date"])
             for x in self.results:
                 if not x["emails"] and not self.inc_no.get(): continue
-                sl=sm.get(x["src"],"—"); site=x.get("website","")
+                sl = sm.get(x["src"], "—")
+                site = x.get("website", "")
                 if not x["emails"]:
-                    w.writerow([x["name"],x["addr"],x["phone"],"","",site,sl,date_s]); rows+=1
+                    w.writerow([x["name"],x["addr"],x["phone"],
+                                "","",site,sl,date_s]); rows += 1
                 else:
-                    for i,(email,role) in enumerate(sorted(x["emails"].items())):
-                        w.writerow([x["name"] if i==0 else "",x["addr"] if i==0 else "",x["phone"] if i==0 else "",email,role,site if i==0 else "",sl if i==0 else "",date_s if i==0 else ""]); rows+=1
-        messagebox.showinfo("✓",f"{self.L('export_ok')}\n{fname}\n\n{rows} lignes")
+                    for i,(email,role) in enumerate(
+                            sorted(x["emails"].items())):
+                        w.writerow([
+                            x["name"]  if i==0 else "",
+                            x["addr"]  if i==0 else "",
+                            x["phone"] if i==0 else "",
+                            email, role,
+                            site       if i==0 else "",
+                            sl         if i==0 else "",
+                            date_s     if i==0 else ""])
+                        rows += 1
+        messagebox.showinfo(
+            "✓", f"{self.L('export_ok')}\n{fname}\n\n{rows} lignes")
         if self.open_csv.get():
             try: os.startfile(fpath)
-            except:
+            except Exception:
                 try: os.system(f'open "{fpath}"')
-                except: pass
+                except Exception: pass
 
 if __name__ == "__main__":
-    App().mainloop()
+    app = App(
+        STRINGS     = T,
+        EXCL_DEFAULT= EXCL_DEFAULT,
+        scrape_page = scrape_page,
+        enrich_dealer = enrich_dealer,
+        norm        = norm,
+        EMAIL_RE    = EMAIL_RE,
+    )
+    app.mainloop()
