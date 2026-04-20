@@ -29,6 +29,11 @@ def detect_system():
         return {"mode":"eco",    "threads":3,  "delay":1.0, "cpu":cpu, "ram":ram}
 
 def _ensure_deps():
+    # If running as a compiled PyInstaller EXE, all deps are already bundled
+    # Only check when running as a plain .py script
+    if getattr(sys, "frozen", False):
+        return  # running as EXE — deps already included by PyInstaller
+
     needed = []
     try: import selenium
     except ImportError: needed.append("selenium")
@@ -46,17 +51,17 @@ def _ensure_deps():
     if needed:
         try:
             root = tk.Tk(); root.withdraw()
-            from tkinter import messagebox
             messagebox.showinfo(
                 "Silence Dealer Finder — Installation",
-                f"Installation des modules requis :\n{chr(10).join(needed)}\n\nCela prend 30 secondes, l'app redémarre ensuite."
+                f"Installation des modules requis :\n{chr(10).join(needed)}"
+                f"\n\nCela prend 30 secondes, l'app redémarre ensuite."
             )
             root.destroy()
         except Exception:
             pass
         for pkg in needed:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "--quiet"])
-        # Restart app after install
+            subprocess.check_call([sys.executable, "-m", "pip", "install",
+                                   pkg, "--quiet"])
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
 _ensure_deps()
@@ -845,6 +850,171 @@ def enrich_dealer(dealer, excl, log, delay=0.8, timeout=15, brand_domain=""):
 
 
 
+def scrape_subpage_network(url, excl, log, prog, timeout=18, brand_domain=""):
+    """
+    Handle sites where each dealer has its OWN sub-page.
+    Pattern: /concessionnaires/ → lists links → /concessionnaire/nom/ → details
+    Examples: moto.suzuki.fr, yamaha-motor.fr, honda-moto.fr
+    
+    Strategy:
+    1. Fetch the listing page → extract all dealer sub-page links
+    2. Fetch each sub-page in parallel → extract name/addr/phone/email
+    """
+    import urllib.parse as _up
+
+    base = re.match(r"https?://[^/]+", url)
+    base_url = base.group(0) if base else ""
+    parsed = _up.urlparse(url)
+    path_base = re.sub(r"/[^/]*$", "/", parsed.path)  # e.g. /concessionnaires/
+
+    log(f"  Détection liens fiches individuelles…")
+    html = fetch(url, timeout=timeout, retries=2)
+    from bs4 import BeautifulSoup as _BS
+    soup = _BS(html, "html.parser")
+
+    # Find all dealer sub-page links
+    dealer_links = []
+    seen_hrefs   = set()
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        # Make absolute
+        if href.startswith("/"):
+            href = base_url + href
+        elif not href.startswith("http"):
+            continue
+        # Must be a sub-page of same domain going deeper
+        if base_url not in href: continue
+        if href == url or href.rstrip("/") == url.rstrip("/"): continue
+        # Must look like a dealer page (deeper path)
+        link_path = _up.urlparse(href).path
+        if not link_path.startswith(parsed.path.rstrip("/")): continue
+        # Avoid pagination, filters, anchors
+        if any(x in href for x in ["?", "#", "page=", "filtre", "search",
+                                     "cart", "panier", "login", "account",
+                                     "mentions", "cgv", "contact-general",
+                                     "politique"]): continue
+        # Must be a different/deeper path
+        depth = len([p for p in link_path.split("/") if p])
+        base_depth = len([p for p in parsed.path.split("/") if p])
+        if depth <= base_depth: continue
+
+        href_clean = href.rstrip("/")
+        if href_clean not in seen_hrefs:
+            seen_hrefs.add(href_clean)
+            # Get text label
+            label = a.get_text(strip=True)[:80]
+            dealer_links.append((href, label))
+
+    if not dealer_links:
+        return []
+
+    log(f"  {len(dealer_links)} fiches individuelles détectées → visite en cours…")
+
+    # Scrape each sub-page in parallel
+    import threading
+    dealers   = []
+    lock      = threading.Lock()
+    done      = [0]
+
+    def scrape_one(href, label):
+        try:
+            sub_html = fetch(href, timeout=timeout, retries=1, ref=url)
+            sub_soup = _BS(sub_html, "html.parser")
+
+            # Remove navigation/footer noise
+            for tag in sub_soup(["script","style","nav","footer","head",
+                                  "header","aside","noscript"]):
+                tag.decompose()
+
+            txt = sub_soup.get_text("\n", strip=True)
+
+            # Extract fields
+            name  = ""
+            addr  = ""
+            phone = ""
+            email = ""
+            site  = ""
+
+            P2 = re.compile(r"(?:\+33|\+34|0)[\s.\-]?[1-9](?:[\s.\-]?\d{2}){4}")
+
+            # Name: h1 or h2 is most reliable
+            for tag in sub_soup.find_all(["h1","h2"]):
+                t = tag.get_text(strip=True)
+                if 3 < len(t) < 80 and not re.search(r"suzuki|moto|yamaha|honda|kawasaki|bmw", t, re.I):
+                    name = t; break
+            if not name:
+                name = label[:80] if label else _up.urlparse(href).path.split("/")[-2].replace("-"," ").title()
+
+            # Address: look for postcode pattern
+            addr_m = re.search(r"(\d{1,4}[^\n]{5,60}\d{5}[^\n]{2,30})", txt)
+            if addr_m: addr = addr_m.group(1).strip()[:150]
+
+            # Phone
+            ph_m = P2.search(txt)
+            if ph_m: phone = ph_m.group(0)
+
+            # Email — from mailto: links first, then text
+            for a2 in sub_soup.find_all("a", href=True):
+                if a2["href"].startswith("mailto:"):
+                    e = a2["href"][7:].split("?")[0].strip().lower()
+                    if is_real(e):
+                        dom = e.split("@")[-1].lower()
+                        if brand_domain and brand_domain in dom: continue
+                        email = e; break
+            if not email:
+                em = EMAIL_RE.search(txt)
+                if em:
+                    e = em.group(0).lower()
+                    dom = e.split("@")[-1].lower()
+                    if not (brand_domain and brand_domain in dom):
+                        email = e
+
+            # Website: external link (not same domain as brand)
+            for a2 in sub_soup.find_all("a", href=True):
+                h2 = a2["href"]
+                if h2.startswith("http") and base_url not in h2:
+                    if not any(x in h2 for x in ["facebook","instagram","twitter",
+                                                   "youtube","linkedin"]):
+                        site = h2; break
+
+            scored = {}
+            if email:
+                s, r = score_email(email, name, source="site",
+                                   brand_domain=brand_domain)
+                if s > 0:
+                    scored[email] = f"{guess_role(email)} [{s}%]"
+
+            with lock:
+                done[0] += 1
+                pct = int(20 + 60 * done[0] / max(len(dealer_links), 1))
+                prog(pct, f"{done[0]}/{len(dealer_links)} — {name[:30]}")
+                if email:
+                    log(f"  ✅ {name[:35]} → {email}")
+                dealers.append({
+                    "name": name[:80], "addr": addr, "phone": phone,
+                    "website": site or href, "profile_url": href,
+                    "emails": scored,
+                    "src": "site" if scored else "pending",
+                    "siret": "", "naf": "",
+                })
+        except Exception as ex:
+            with lock:
+                done[0] += 1
+                log(f"  ⚠ {href[-40:]}: {str(ex)[:40]}")
+
+    # Parallel with up to 8 threads
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = {ex.submit(scrape_one, href, label): href
+                   for href, label in dealer_links}
+        for f in as_completed(futures):
+            pass  # results collected via lock
+
+    log(f"  ✓ {len(dealers)} concessionnaires · {sum(1 for d in dealers if d['emails'])} avec email")
+    return dealers
+
+
 def parse_plain_text_page(text, excl, brand_domain=""):
     dealers = []
     SKIP = {
@@ -949,6 +1119,36 @@ def scrape_page(url, excl, log, prog, timeout=18, retries=3):
     prog(18, "Analyse HTML…")
     dealers = []
     PHONE_RE2 = re.compile(r"(?:\+33|\+34|\+44|0)[\s.\-]?[1-9](?:[\s.\-]?\d{2}){4}")
+
+    # ── Détection automatique : réseau de fiches individuelles ───────────────
+    # Sites comme Suzuki, Yamaha, Honda où chaque concessionnaire a sa propre page
+    # Heuristique : page listing avec >10 liens vers sous-pages du même domaine
+    try:
+        from bs4 import BeautifulSoup as _BS4
+        _soup_check = _BS4(html, "html.parser")
+        parsed_check = __import__("urllib.parse", fromlist=["urlparse"]).urlparse(url)
+        base_check   = re.match(r"https?://[^/]+", url).group(0)
+        _path        = parsed_check.path.rstrip("/")
+        _sub_links   = set()
+        for _a in _soup_check.find_all("a", href=True):
+            _h = _a["href"]
+            if _h.startswith("/"): _h = base_check + _h
+            if base_check in _h:
+                _lpath = __import__("urllib.parse", fromlist=["urlparse"]).urlparse(_h).path
+                _depth = len([p for p in _lpath.split("/") if p])
+                _base_d= len([p for p in _path.split("/") if p])
+                if _depth > _base_d and "?" not in _h and "#" not in _h:
+                    _sub_links.add(_h)
+        if len(_sub_links) >= 10:
+            log(f"  Réseau de fiches individuelles détecté ({len(_sub_links)} liens)")
+            sub_dealers = scrape_subpage_network(url, excl, log, prog,
+                                                  timeout=timeout,
+                                                  brand_domain=brand_domain)
+            if len(sub_dealers) >= 5:
+                log(f"✓ {len(sub_dealers)} concessionnaires via fiches individuelles")
+                return sub_dealers
+    except Exception as _se:
+        log(f"  ↳ Détection fiches: {str(_se)[:40]}")
     ADDR_RE2  = re.compile(r"\d{1,4}[\s,]+[^\d\n]{5,60}[\s,]+\d{5}[\s,]+[A-ZÀ-Ÿa-zà-ÿ\s\-]{2,35}", re.I)
 
     try:
@@ -1367,46 +1567,88 @@ class App(tk.Tk):
         f = self._f1
         P = dict(padx=32)
 
-        # URL row
-        self._lbl_url = tk.Label(f, text="", bg=W, fg=T2,
+        # ── Mode selector ─────────────────────────────────────────────────
+        top_row = tk.Frame(f, bg=W)
+        top_row.pack(fill="x", padx=32, pady=(20, 0))
+        self._input_mode = tk.StringVar(value="url")
+        for val, lbl in [("url","🔗  URL du site"), ("paste","📋  Coller le texte")]:
+            tk.Radiobutton(top_row, text=lbl, variable=self._input_mode,
+                           value=val, bg=W, fg=T1, font=(FONT, 9),
+                           activebackground=W, selectcolor=W, cursor="hand2",
+                           command=self._toggle_input_mode).pack(side="left", padx=(0,24))
+
+        # ── URL frame ──────────────────────────────────────────────────
+        self._url_frame = tk.Frame(f, bg=W)
+        self._url_frame.pack(fill="x", padx=32, pady=(10,0))
+        self._lbl_url = tk.Label(self._url_frame, text="", bg=W, fg=T2,
                                   font=(FONT, 8, "bold"))
-        self._lbl_url.pack(anchor="w", padx=32, pady=(24, 8))
-
-        row = tk.Frame(f, bg=W)
-        row.pack(fill="x", **P)
-
-        # Input field — clean with bottom border only
-        ef = tk.Frame(row, bg=G2, highlightthickness=1,
+        self._lbl_url.pack(anchor="w", pady=(0,6))
+        row_u = tk.Frame(self._url_frame, bg=W)
+        row_u.pack(fill="x")
+        ef = tk.Frame(row_u, bg=G2, highlightthickness=1,
                       highlightbackground=G3, highlightcolor=R)
-        ef.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ef.pack(side="left", fill="x", expand=True, padx=(0,10))
         self._url = tk.StringVar(
             value="https://www.aixam.com/fr/reseau/voiture-sans-permis-france")
-        self._url_entry = tk.Entry(
-            ef, textvariable=self._url,
-            font=(FONT, 10), bg=G2, fg=T1,
-            insertbackground=R, relief="flat", bd=0,
-            highlightthickness=0)
+        self._url_entry = tk.Entry(ef, textvariable=self._url,
+                                    font=(FONT, 10), bg=G2, fg=T1,
+                                    insertbackground=R, relief="flat",
+                                    bd=0, highlightthickness=0)
         self._url_entry.pack(fill="x", padx=14, pady=10)
-
-        # Extract button
-        self._btn = tk.Button(
-            row, text="",
-            bg=R, fg=W, font=(FONT, 10, "bold"),
-            relief="flat", bd=0, cursor="hand2",
-            padx=26, pady=11,
-            activebackground=RH, activeforeground=W,
-            command=self._start)
+        self._btn = tk.Button(row_u, text="",
+                               bg=R, fg=W, font=(FONT, 10, "bold"),
+                               relief="flat", bd=0, cursor="hand2",
+                               padx=26, pady=11,
+                               activebackground=RH, activeforeground=W,
+                               command=self._start)
         self._btn.pack(side="left")
+        self._pause_btn = tk.Button(row_u, text="⏸",
+                                     bg=G1, fg=T2, font=(FONT, 11),
+                                     relief="flat", bd=0, cursor="hand2",
+                                     padx=13, pady=11, state="disabled",
+                                     activebackground=AL,
+                                     command=self._toggle_pause)
+        self._pause_btn.pack(side="left", padx=(8,0))
 
-        # Pause button
-        self._pause_btn = tk.Button(
-            row, text="⏸",
-            bg=G1, fg=T2, font=(FONT, 11),
-            relief="flat", bd=0, cursor="hand2",
-            padx=13, pady=11, state="disabled",
-            activebackground=AL,
-            command=self._toggle_pause)
-        self._pause_btn.pack(side="left", padx=(8, 0))
+        # ── Paste frame ────────────────────────────────────────────────
+        self._paste_frame = tk.Frame(f, bg=W)
+        # (starts hidden)
+        tk.Label(self._paste_frame,
+                 text="Collez ici le texte copié de la page concessionnaires :",
+                 bg=W, fg=T2, font=(FONT, 8, "bold")).pack(anchor="w", pady=(0,6))
+        row_p = tk.Frame(self._paste_frame, bg=W)
+        row_p.pack(fill="x")
+        pw = tk.Frame(row_p, bg=G2, highlightthickness=1,
+                      highlightbackground=G3, highlightcolor=R)
+        pw.pack(side="left", fill="x", expand=True, padx=(0,10))
+        self._paste_txt = tk.Text(pw, height=5, font=(FONT, 9),
+                                   bg=G2, fg=T3, insertbackground=R,
+                                   relief="flat", bd=0, highlightthickness=0,
+                                   padx=10, pady=8, wrap="word")
+        self._paste_txt.pack(fill="x")
+        self._paste_txt.insert("1.0",
+            "Ctrl+A puis Ctrl+C sur la page du réseau concessionnaires, "
+            "puis collez ici avec Ctrl+V…")
+        self._paste_txt.bind("<FocusIn>", lambda e: (
+            self._paste_txt.delete("1.0","end"),
+            self._paste_txt.configure(fg=T1)
+        ) if self._paste_txt.get("1.0","end-1c").startswith("Ctrl+") else None)
+        pc = tk.Frame(row_p, bg=W)
+        pc.pack(side="left")
+        self._btn_paste = tk.Button(pc, text="Analyser",
+                                     bg=R, fg=W, font=(FONT, 10, "bold"),
+                                     relief="flat", bd=0, cursor="hand2",
+                                     padx=22, pady=11,
+                                     activebackground=RH,
+                                     command=self._start_paste)
+        self._btn_paste.pack()
+        self._pause_btn_paste = tk.Button(pc, text="⏸",
+                                           bg=G1, fg=T2, font=(FONT, 11),
+                                           relief="flat", bd=0, cursor="hand2",
+                                           padx=13, pady=6, state="disabled",
+                                           activebackground=AL,
+                                           command=self._toggle_pause)
+        self._pause_btn_paste.pack(pady=(4,0))
 
         # Options
         opt = tk.Frame(f, bg=W)
@@ -1810,6 +2052,99 @@ class App(tk.Tk):
             self._perf_info.configure(text=f"  {cfg['info']}")
         except Exception:
             pass
+
+    def _toggle_input_mode(self):
+        if self._input_mode.get() == "url":
+            self._paste_frame.pack_forget()
+            self._url_frame.pack(fill="x", padx=32, pady=(10,0))
+        else:
+            self._url_frame.pack_forget()
+            self._paste_frame.pack(fill="x", padx=32, pady=(10,0))
+
+    def _start_paste(self):
+        if self._run: return
+        text = self._paste_txt.get("1.0","end-1c").strip()
+        if not text or text.startswith("Ctrl+"):
+            messagebox.showerror("","Collez d'abord le texte de la page."); return
+        self._run = True; self._paused = False; self._pause_ev.set()
+        self._btn_paste.configure(state="disabled", text="En cours…")
+        self._pause_btn_paste.configure(state="normal")
+        self._log.configure(state="normal"); self._log.delete("1.0","end")
+        self._log.configure(state="disabled")
+        self._set_prog(0,"Analyse du texte…"); self._pct_lbl.configure(text="")
+        for v in self._sv.values(): v.set("—")
+        self._start_anim()
+        threading.Thread(target=self._worker_paste,args=(text,),daemon=True).start()
+
+    def _worker_paste(self, text):
+        try:
+            self._log_add("📋 Analyse du texte collé — pas de connexion requise","ok")
+            dealers = parse_plain_text_page(text, self.excl, brand_domain="")
+            if not dealers:
+                self._log_add("⚠ Aucun concessionnaire détecté — vérifiez le texte","fail")
+                self._run=False; self._stop_anim()
+                self.after(0,lambda:self._btn_paste.configure(state="normal",text="Analyser"))
+                return
+            em0 = sum(1 for d in dealers if d["emails"])
+            self._log_add(f"✅ {len(dealers)} concessionnaires · {em0} avec email direct","ok")
+            self._set_prog(30,f"{len(dealers)} concessionnaires…")
+            if self._v1.get() and em0 < len(dealers):
+                excl=self.excl if self._v3.get() else []
+                dly=self.delay.get(); to=self.timeout_v.get()
+                self._log_add(f"⚡ Enrichissement {len(dealers)-em0} concessionnaires sans email…","ok")
+                lock=threading.Lock(); done=[0]
+                def do_one(d):
+                    self._pause_ev.wait()
+                    try:
+                        if not d["emails"]:
+                            em,src=self._ED(d,excl,self._log_add,delay=dly,timeout=to)
+                            if em: d["emails"]=em; d["src"]=src
+                    except Exception as e:
+                        self._log_add(f"  ⚠ {d['name'][:30]}: {e}")
+                    finally:
+                        with lock:
+                            done[0]+=1
+                            pct=30+int(65*done[0]/max(len(dealers),1))
+                            self._set_prog(pct,f"{done[0]}/{len(dealers)} — {d['name'][:30]}")
+                            self.results=list(dealers)
+                            self.after(0,self._render)
+                threads=[]
+                for d in dealers:
+                    self._pause_ev.wait()
+                    t=threading.Thread(target=do_one,args=(d,),daemon=True)
+                    threads.append(t); t.start()
+                    while sum(1 for x in threads if x.is_alive())>=self._max_threads:
+                        time.sleep(0.2)
+                for t in threads: t.join(timeout=40)
+            if self._v2.get():
+                seen,uniq=set(),[]
+                for d in dealers:
+                    k=re.sub(r"[^a-z0-9]","",d["name"].lower())[:20]
+                    if k not in seen: seen.add(k); uniq.append(d)
+                dealers=uniq
+            total=sum(len(d["emails"]) for d in dealers)
+            self._set_prog(100,"Terminé ✓")
+            self._log_add(f"━━  {len(dealers)} concessionnaires · {total} emails  ━━","head")
+            self.results=dealers
+            self.after(0,self._finish_paste)
+        except Exception as e:
+            self.after(0,lambda:messagebox.showerror("Erreur",str(e)))
+            self._log_add(f"✗ {e}","fail")
+            self._run=False; self._stop_anim()
+            self.after(0,lambda:self._btn_paste.configure(state="normal",text="Analyser"))
+
+    def _finish_paste(self):
+        self._run=False; self._paused=False; self._stop_anim()
+        self._pause_btn_paste.configure(state="disabled",text="⏸",bg=G1,fg=T2)
+        d=self.results
+        em=sum(len(x["emails"]) for x in d)
+        wb=sum(1 for x in d if x.get("src") in ("web","hunter","site","page"))
+        ad=sum(1 for x in d if x.get("addr"))
+        self._sv["s1"].set(str(len(d))); self._sv["s2"].set(str(em))
+        self._sv["s3"].set(str(wb)); self._sv["s4"].set(str(ad))
+        self._btn_paste.configure(state="normal",text="Analyser à nouveau")
+        self._status_lbl.configure(text=self.L("last")+datetime.now().strftime("%H:%M"))
+        self._render(); self._nb.select(self._f2)
 
     def _toggle_pause(self):
         if not self._run: return
